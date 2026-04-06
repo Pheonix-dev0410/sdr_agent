@@ -1,0 +1,32 @@
+# Environment — contains real API keys, NEVER commit
+.env
+*.env
+
+# Google service account credentials
+credentials/
+sale-*.json
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+logs/
+*.log
+pipeline.log
+
+# Checkpoints / DB
+checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
