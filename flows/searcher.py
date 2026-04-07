@@ -1,7 +1,7 @@
 import json
 import logging
 
-from clients.openai_client import call_gpt5
+from clients.openai_client import call_gpt5, call_gpt_fast
 from clients.unipile_client import (
     search_salesnav, search_classic,
     fetch_linkedin_profile, extract_username,
@@ -40,7 +40,7 @@ Examples:
 Return ONLY this JSON:
 {{"role_clusters": {{"exact role name": ["term1", "term2"]}}}}"""
 
-    raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
+    raw = call_gpt_fast(prompt, use_web_search=False, temperature=0.1)
     result = parse_gpt_json(raw)
     if not result:
         logger.warning("Role expansion GPT parse failed, using role names as-is")
@@ -48,25 +48,55 @@ Return ONLY this JSON:
     return result.get("role_clusters", {role: [role] for role in missing_roles})
 
 
+def _strip_title_noise(title: str) -> str:
+    """
+    Remove company-name suffixes and noise from job titles before matching.
+    Examples:
+      "COO- Peter England"              → "COO"
+      "COO, Sunlight Resources Ltd"     → "COO"
+      "Head of Sales @ Pladis"          → "Head of Sales"
+      "Sales Director at Coca-Cola"     → "Sales Director"
+      "Global Sales Director"           → "Global Sales Director"  (scope prefix kept, handled by GPT)
+    """
+    import re
+    # Strip " - Company", " @ Company", " at Company" patterns
+    # Only strip if what follows looks like a proper noun / company name (starts with uppercase)
+    title = re.sub(r'\s*[-–]\s+[A-Z][^,]*$', '', title).strip()
+    title = re.sub(r'\s+[@]\s+[A-Z][^,]*$', '', title).strip()
+    title = re.sub(r'\s+at\s+[A-Z][^,]*$', '', title, flags=re.IGNORECASE).strip()
+    # Strip trailing ", Company Name" (comma followed by capitalised words)
+    title = re.sub(r',\s+[A-Z][A-Za-z\s&.]+(?:Ltd|Inc|Corp|LLC|GmbH|Pvt|Limited|Co\.|Group)?\.?\s*$', '', title).strip()
+    return title
+
+
 def _filter_candidates(candidates: list[dict], current_role: str, company_name: str, country: str) -> dict:
     if not candidates:
         return {"match_found": False}
 
-    prompt = f"""I'm looking for someone who fills the role "{current_role}" at {company_name} in {country}.
+    # Pre-clean titles to remove company-name noise before sending to GPT
+    cleaned = []
+    for c in candidates[:10]:
+        c2 = dict(c)
+        c2["title"] = _strip_title_noise(c2.get("title", ""))
+        cleaned.append(c2)
+
+    prompt = f"""I'm looking for someone who CURRENTLY works at {company_name} in {country} and fills the role "{current_role}".
 
 Here are search results:
-{json.dumps(candidates[:10])}
+{json.dumps(cleaned)}
 
-Which person (if any) best matches? Consider:
-- Titles in any language
-- Seniority (want director/manager/head, not junior)
-- Company match (must work at {company_name} or known subsidiary)
-- Adjacent roles (e.g., "Supply Chain Director" matches "Head of Distribution")
+Rules:
+- The person MUST currently work at {company_name} (or a known subsidiary/brand of it). Reject anyone whose title shows they work at a DIFFERENT company.
+- Titles in any language are fine.
+- Seniority must match: want Director/Head/VP/C-suite level — not junior or Manager-level.
+- Scope prefixes (Global, Regional, National, Senior) don't disqualify: "Global Sales Director" = "Sales Director".
+- Compound titles: "CEO & Co-Founder" → counts as CEO. "Co-Founder and CTO" → counts as CTO.
+- If no candidate clearly works at {company_name}, return match_found: false.
 
 Return ONLY this JSON:
 {{"match_found": true, "person_index": 0, "first_name": "...", "last_name": "...", "title": "...", "linkedin_url": "...", "confidence": 0.85, "reason": "..."}}"""
 
-    raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
+    raw = call_gpt_fast(prompt, use_web_search=False, temperature=0.1)
     result = parse_gpt_json(raw)
     if not result:
         return {"match_found": False}
@@ -245,6 +275,33 @@ Return ONLY this JSON:
     return result
 
 
+def _lookup_linkedin(first: str, last: str, company_name: str) -> str:
+    """
+    Try to find a LinkedIn URL for a person via Unipile classic search.
+    Returns the URL string or empty string if not found.
+    Used as a fallback when firecrawl/GPT finds a name but no LinkedIn profile.
+    """
+    try:
+        query = f"{first} {last} {company_name}"
+        results = search_classic(keywords=query, limit=5)
+        if not results:
+            return ""
+        # Pick the first result that mentions the company name
+        company_lower = company_name.lower()
+        for r in results:
+            item = normalize_classic_item(r)
+            title = item.get("title", "").lower()
+            headline = item.get("headline", "").lower()
+            if company_lower in title or company_lower in headline:
+                return item.get("linkedin_url", "") or item.get("profile_url", "")
+        # Fallback: just return the first result's URL
+        first_item = normalize_classic_item(results[0])
+        return first_item.get("linkedin_url", "") or first_item.get("profile_url", "")
+    except Exception as e:
+        logger.debug(f"LinkedIn lookup failed for {first} {last}: {e}")
+        return ""
+
+
 def _build_contact_from_match(
     match: dict,
     current_role: str,
@@ -254,6 +311,17 @@ def _build_contact_from_match(
     first = match.get("first_name", "")
     last = match.get("last_name", "")
     domain = company_context.get("domain", "")
+    company_name = company_context.get("company_name", "")
+
+    # Get extra fields from raw Apollo/Clay result if available
+    raw = match.get("_raw", {})
+
+    # LinkedIn URL: use what the layer found, fall back to Unipile name search
+    linkedin_url = match.get("linkedin_url") or raw.get("linkedin_url", "")
+    if not linkedin_url and first and last and company_name:
+        linkedin_url = _lookup_linkedin(first, last, company_name)
+        if linkedin_url:
+            logger.info(f"  LinkedIn found via name search for {first} {last}: {linkedin_url}")
 
     email = ""
     email_status = "unknown"
@@ -276,15 +344,12 @@ def _build_contact_from_match(
                 email = primary_email
                 email_status = zb.get("status", "unknown")
 
-    # Get extra fields from raw Apollo/Clay result if available
-    raw = match.get("_raw", {})
-
     return {
         "first_name": first,
         "last_name": last,
         "job_title": match.get("title", ""),
         "matched_role": current_role,
-        "linkedin_url": match.get("linkedin_url") or raw.get("linkedin_url", ""),
+        "linkedin_url": linkedin_url,
         "email": email,
         "email_status": email_status,
         "phone_1": raw.get("phone_numbers", [{}])[0].get("sanitized_number", "") if raw.get("phone_numbers") else "",

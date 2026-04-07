@@ -8,9 +8,23 @@ def strip_accents(s: str) -> str:
     )
 
 
+def _sanitize_name_part(name: str) -> str:
+    """
+    Clean a name part for use in email construction.
+    - Strip accents
+    - Lowercase and strip whitespace
+    - Take only the FIRST word (handles compound first names like "Vivek Prakash" → "vivek")
+    - Remove any remaining spaces (safety net)
+    """
+    cleaned = strip_accents(name.lower().strip())
+    # Take first word only — middle names/compound names cause spaces in email
+    first_word = cleaned.split()[0] if cleaned.split() else cleaned
+    return first_word.replace(' ', '')
+
+
 def construct_email(first_name: str, last_name: str, email_format: str, domain: str) -> str:
-    first = strip_accents(first_name.lower().strip())
-    last = strip_accents(last_name.lower().strip())
+    first = _sanitize_name_part(first_name)
+    last = _sanitize_name_part(last_name)
     f = first[0] if first else ''
     l = last[0] if last else ''
 

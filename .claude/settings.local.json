@@ -11,7 +11,20 @@
       "Bash(curl -s -X POST http://localhost:8000/api/n8n/contacts -H \"Content-Type: application/json\" -d \"[{\\\\\"first_name\\\\\":\\\\\"Vipin\\\\\",\\\\\"last_name\\\\\":\\\\\"Kataria\\\\\",\\\\\"job_title\\\\\":\\\\\"Chief Commercial Officer\\\\\",\\\\\"email\\\\\":\\\\\"v.kataria@britindia.com\\\\\",\\\\\"company_name\\\\\":\\\\\"Britannia Industries\\\\\",\\\\\"country\\\\\":\\\\\"India\\\\\",\\\\\"domain\\\\\":\\\\\"britannia.co.in\\\\\",\\\\\"linkedin_url\\\\\":\\\\\"https://www.linkedin.com/in/vipin-kataria\\\\\"}]\")",
       "Bash(curl -s http://localhost:8000/api/n8n/debug)",
       "Bash(curl -s -X POST http://localhost:8000/api/n8n/flush)",
-      "Bash(curl -s http://localhost:8000/api/n8n/pipeline)"
+      "Bash(curl -s http://localhost:8000/api/n8n/pipeline)",
+      "Bash(Read \"C:\\\\Users\\\\manoc\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-manoc-Desktop-internship-salescode-ai-sdr-agent\\\\52e25dcd-20e0-4d98-9f4f-817e71f69b67\\\\tasks\\\\b76xu7tga.output\")",
+      "Bash(netstat -ano)",
+      "Bash(findstr :8000)",
+      "Bash(taskkill /PID 105136 /F)",
+      "Bash(cmd /c \"taskkill /PID 105136 /F\")",
+      "Bash(cmd /c \"netstat -ano | findstr :8000\")",
+      "Bash(cmd /c \"taskkill /F /PID 105136 2>&1\")",
+      "Bash(cmd /c \"netstat -ano | findstr :8000 2>&1\")",
+      "Bash(python -c ':*)",
+      "Bash(python -m uvicorn main:app --port 8000)",
+      "Bash(python -c \"import urllib.request; print\\(urllib.request.urlopen\\('http://localhost:8000/health'\\).read\\(\\).decode\\(\\)\\)\")",
+      "Bash(python test_under_review.py)",
+      "Bash(python -c \"from clients.openai_client import call_gpt5; print\\(call_gpt5\\('hi :\\)'\\)\\)\")"
     ]
   }
 }

@@ -35,7 +35,13 @@ from config import OUTPUT_SHEET_ID, N8N_WEBHOOK_URL, N8N_SUBMISSION_DELAY
 from flows.company_intel import scrape_company_intel
 from flows.verifier import verify_contacts, TARGET_ROLES
 from flows.searcher import search_gaps
-from clients.sheets_client import write_rows, contact_to_row, SHEET_HEADERS
+from clients.sheets_client import (
+    write_rows, contact_to_row, SHEET_HEADERS,
+    write_target_account, write_verified_contacts,
+    read_first_clean_list_for_company, count_pending_contacts,
+    write_contacts_to_first_clean_list,
+    TAB_ACCEPTED, TAB_UNDER_REVIEW, TAB_REJECTED,
+)
 from utils.dedup import deduplicate
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -72,6 +78,13 @@ _n8n_last_received: dict = {}
 # Company metadata store: populated on /api/trigger so we have full context
 # when contacts arrive later from n8n
 _company_metadata: dict[str, dict] = {}
+
+# Tracks companies that were triggered to n8n but haven't received contacts yet
+# company_name -> {"triggered_at": float, "n8n_ok": bool}
+_n8n_pending_companies: dict[str, dict] = {}
+
+# Per-company auto-trigger tasks — cancelled if contacts arrive via API first
+_n8n_auto_trigger_tasks: dict[str, asyncio.Task] = {}
 
 
 # ── Field Normalization ───────────────────────────────────────────────────────
@@ -215,39 +228,40 @@ def _infer_meta_from_contacts(contacts: list[dict]) -> dict:
 
 # ── n8n Submission ────────────────────────────────────────────────────────────
 
-async def submit_to_n8n(payload: dict[str, Any]) -> bool:
+async def submit_to_n8n(payload: dict[str, Any], company_name: str = "") -> bool:
     """
-    POST a company row payload to the n8n webhook.
-    Retries up to 3 times with 30-second backoff.
-    Returns True on success, False on permanent failure.
+    POST a company row payload to the n8n webhook — exactly once, no retries.
+    The sheet poller handles the case where n8n didn't write anything.
+    Returns True on success, False on failure.
     """
     if not N8N_WEBHOOK_URL:
         logger.warning("N8N_WEBHOOK_URL not configured — skipping n8n submission")
+        if company_name and company_name in _n8n_pending_companies:
+            _n8n_pending_companies[company_name]["n8n_ok"] = False
+            _n8n_pending_companies[company_name]["error"] = "N8N_WEBHOOK_URL not configured"
         return False
 
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    N8N_WEBHOOK_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-                resp.raise_for_status()
-            logger.info(
-                f"n8n submitted: company={payload.get('Company_Name', '')} "
-                f"status={resp.status_code}"
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                N8N_WEBHOOK_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
             )
-            return True
-        except httpx.HTTPError as e:
-            if attempt == 2:
-                logger.error(f"n8n submission failed after 3 attempts: {e}")
-                return False
-            backoff = 30 * (attempt + 1)
-            logger.warning(f"n8n retry {attempt + 1}/3 in {backoff}s — {e}")
-            await asyncio.sleep(backoff)
-
-    return False
+            resp.raise_for_status()
+        logger.info(
+            f"n8n submitted: company={payload.get('Company_Name', '')} "
+            f"status={resp.status_code}"
+        )
+        if company_name and company_name in _n8n_pending_companies:
+            _n8n_pending_companies[company_name]["n8n_ok"] = True
+        return True
+    except httpx.HTTPError as e:
+        logger.error(f"n8n submission failed: {e}")
+        if company_name and company_name in _n8n_pending_companies:
+            _n8n_pending_companies[company_name]["n8n_ok"] = False
+            _n8n_pending_companies[company_name]["error"] = str(e)
+        return False
 
 
 # ── Core Pipeline (synchronous — runs in thread executor) ─────────────────────
@@ -259,14 +273,13 @@ def _run_company_pipeline(
     status_record: dict,
 ) -> None:
     """
-    Full pipeline for one company.
-    This function is synchronous (all IO calls are blocking) so it MUST be
-    invoked via asyncio.get_running_loop().run_in_executor().
-
-    contacts      — list of normalized contact dicts received from n8n
-    meta          — company context dict {country, domain, account_type, ...}
-    status_record — mutable dict updated in-place; the async polling endpoint
-                    reads it live to show progress
+    Full pipeline for one company:
+      1. Company intel scrape
+      2. Merge buffered n8n contacts with First Clean List (what n8n wrote to sheet)
+      3. Veri R1 — verify all n8n contacts → write to Accepted/Under Review/Rejected
+      4. Gap report — which target roles are still missing?
+      5. Searcher waterfall — find missing roles
+      6. Veri R2 — verify searcher contacts → write to sheets
     """
     global _n8n_chain_current_step
 
@@ -285,7 +298,7 @@ def _run_company_pipeline(
 
     logger.info(
         f"Pipeline start: {company_name} ({country}) | "
-        f"{len(contacts)} n8n contacts | account_type={account_type}"
+        f"{len(contacts)} buffered contacts | account_type={account_type}"
     )
 
     def _step(name: str, state: str = "running") -> None:
@@ -293,42 +306,52 @@ def _run_company_pipeline(
         _n8n_chain_current_step = name
         status_record["steps"][name] = state
 
-    # ── Step veri_r1: Company intel + verify n8n contacts + gap report ────────
-    # (company intel runs inside veri_r1 as preparation context)
+    # ── Step veri_r1: Company intel + merge sources + verify + write sheets ───
     _step("veri_r1")
     verified_contacts: list[dict] = []
     gap_report: dict = {}
+    sheet_counts_r1 = {"accepted": 0, "under_review": 0, "rejected": 0}
     try:
-        company_intel = scrape_company_intel(
-            company_name,
-            company_context["domain"],
-            country,
-            account_type,
-        )
-    except Exception as e:
-        logger.error(f"Company intel failed for {company_name}: {e}")
-        company_intel = {
-            "scraped_content": {},
-            "people_found": [],
-            "combined_text": "",
-            "scraped_urls": [],
-        }
+        # a. Company intel
+        try:
+            company_intel = scrape_company_intel(
+                company_name, company_context["domain"], country, account_type,
+            )
+        except Exception as e:
+            logger.error(f"Company intel failed for {company_name}: {e}")
+            company_intel = {"scraped_content": {}, "people_found": [], "combined_text": "", "scraped_urls": []}
 
-    try:
-        if contacts:
-            verify_result = verify_contacts(company_context, contacts, company_intel)
+        # b. Merge webhook buffer with First Clean List, then deduplicate the whole batch
+        all_contacts = list(contacts)
+        if OUTPUT_SHEET_ID:
+            sheet_contacts = read_first_clean_list_for_company(OUTPUT_SHEET_ID, company_name)
+            all_contacts.extend(sheet_contacts)
+            logger.info(f"Merged: {len(contacts)} buffered + {len(sheet_contacts)} from sheet = {len(all_contacts)} raw")
+
+        # Deduplicate before verification — n8n can send the same person twice
+        # with slightly different field values. deduplicate() uses LinkedIn URL +
+        # full name as keys, so the same person from two sources is reduced to one.
+        all_contacts = deduplicate(all_contacts, [])
+        logger.info(f"After dedup: {len(all_contacts)} unique contacts to verify")
+
+        # c. Verify
+        if all_contacts:
+            verify_result = verify_contacts(company_context, all_contacts, company_intel)
             verified_contacts = verify_result["verified_contacts"]
             gap_report = verify_result["gap_report"]
             logger.info(
-                f"Veri R1 complete: valid={verify_result['valid_count']} "
+                f"Veri R1: valid={verify_result['valid_count']} "
                 f"invalid={verify_result['invalid_count']} "
                 f"needs_review={verify_result['needs_review_count']}"
             )
+            # d. Write R1 results to Accepted/Under Review/Rejected
+            if OUTPUT_SHEET_ID:
+                sheet_counts_r1 = write_verified_contacts(
+                    OUTPUT_SHEET_ID, verified_contacts, company_name, country, meta
+                )
         else:
-            logger.info("No n8n contacts received — will search all target roles")
-            missing_all = TARGET_ROLES.get(
-                account_type.lower(), TARGET_ROLES.get("distributor", [])
-            )
+            logger.info("No contacts from n8n or sheet — will search all target roles")
+            missing_all = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
             gap_report = {
                 "missing_roles": missing_all,
                 "covered_roles": [],
@@ -339,14 +362,9 @@ def _run_company_pipeline(
     except Exception as e:
         logger.error(f"Veri R1 failed for {company_name}: {e}")
         _step("veri_r1", f"failed: {e}")
-        gap_report = {
-            "missing_roles": [],
-            "covered_roles": [],
-            "coverage_percentage": 0,
-            "potential_leads_from_web": [],
-        }
+        gap_report = {"missing_roles": [], "covered_roles": [], "coverage_percentage": 0, "potential_leads_from_web": []}
 
-    # ── Step searcher: Waterfall search for missing roles ─────────────────────
+    # ── Step searcher: Find missing roles ─────────────────────────────────────
     missing_roles: list[str] = gap_report.get("missing_roles", [])
     potential_leads: list[dict] = gap_report.get("potential_leads_from_web", [])
 
@@ -355,104 +373,189 @@ def _run_company_pipeline(
     manual_tasks: list[dict] = []
     try:
         if missing_roles:
-            logger.info(
-                f"Searching {len(missing_roles)} missing roles for {company_name}"
-            )
+            logger.info(f"Searcher: {len(missing_roles)} missing roles for {company_name}")
             search_result = search_gaps(
-                company_context,
-                missing_roles,
-                verified_contacts,
-                company_intel,
-                potential_leads,
+                company_context, missing_roles, verified_contacts, company_intel, potential_leads,
             )
             raw_searcher_contacts = search_result["new_contacts"]
             manual_tasks = search_result["manual_tasks"]
             logger.info(
-                f"Searcher complete: found={search_result['total_found']} "
-                f"manual={search_result['total_manual']}"
+                f"Searcher done: found={search_result['total_found']} manual={search_result['total_manual']}"
             )
         else:
-            logger.info("All roles covered — skipping searcher waterfall")
+            logger.info("All roles covered — skipping searcher")
         _step("searcher", "done")
     except Exception as e:
         logger.error(f"Searcher failed for {company_name}: {e}")
         _step("searcher", f"failed: {e}")
 
-    # ── Step veri_r2: Verify searcher-found contacts ──────────────────────────
+    # ── Step veri_r2: Verify searcher contacts + write to sheets ─────────────
     _step("veri_r2")
     verified_searcher_contacts: list[dict] = []
+    sheet_counts_r2 = {"accepted": 0, "under_review": 0, "rejected": 0}
     try:
         deduped_searcher = deduplicate(raw_searcher_contacts, verified_contacts)
+
+        # Write ALL searcher contacts to First Clean List BEFORE verifying them
+        # so every contact found from any source is recorded there.
+        # pipeline_status="searcher" keeps the poller from re-picking them up.
+        if deduped_searcher and OUTPUT_SHEET_ID:
+            write_contacts_to_first_clean_list(
+                OUTPUT_SHEET_ID, deduped_searcher, meta, pipeline_status="searcher"
+            )
+
         if deduped_searcher:
             logger.info(f"Veri R2: verifying {len(deduped_searcher)} searcher contacts")
             r2_result = verify_contacts(company_context, deduped_searcher, company_intel)
             verified_searcher_contacts = r2_result["verified_contacts"]
             logger.info(
-                f"Veri R2 complete: valid={r2_result['valid_count']} "
+                f"Veri R2: valid={r2_result['valid_count']} "
                 f"invalid={r2_result['invalid_count']} "
                 f"needs_review={r2_result['needs_review_count']}"
             )
+            if OUTPUT_SHEET_ID:
+                sheet_counts_r2 = write_verified_contacts(
+                    OUTPUT_SHEET_ID, verified_searcher_contacts, company_name, country, meta
+                )
         else:
-            logger.info("Veri R2: no new searcher contacts to verify")
+            logger.info("Veri R2: no new contacts to verify")
         _step("veri_r2", "done")
     except Exception as e:
         logger.error(f"Veri R2 failed for {company_name}: {e}")
         _step("veri_r2", f"failed: {e}")
-        verified_searcher_contacts = deduped_searcher if deduped_searcher else []
 
-    # ── Step sheet_write: Write all results to Google Sheets ──────────────────
-    all_output_contacts = verified_contacts + verified_searcher_contacts
-
-    _step("sheet_write")
-    try:
-        rows: list[list] = [SHEET_HEADERS]
-
-        for contact in all_output_contacts:
-            rows.append(contact_to_row(contact, company_name, country))
-
-        if manual_tasks:
-            pad = [""] * (len(SHEET_HEADERS) - 1)
-            rows.append(["--- MANUAL TASKS ---"] + pad)
-            for task in manual_tasks:
-                row = [""] * len(SHEET_HEADERS)
-                row[0] = task["company"]
-                row[1] = task["country"]
-                row[4] = task["role"]
-                row[5] = task["role"]
-                row[6] = "manual"
-                row[12] = "manual_needed"
-                row[14] = "manual_needed"
-                row[15] = task["task"]
-                rows.append(row)
-
-        if OUTPUT_SHEET_ID:
-            write_rows(OUTPUT_SHEET_ID, rows)
-            logger.info(f"Wrote {len(rows)} rows to Google Sheets for {company_name}")
-        else:
-            logger.warning("OUTPUT_SHEET_ID not set — skipping Google Sheets write")
-        _step("sheet_write", "done")
-    except Exception as e:
-        logger.error(f"Sheet write failed for {company_name}: {e}")
-        _step("sheet_write", f"failed: {e}")
+    # ── Manual tasks go to Under Review sheet ────────────────────────────────
+    if manual_tasks and OUTPUT_SHEET_ID:
+        from clients.sheets_client import _append_rows, VERIFICATION_HEADERS, _ensure_headers, TAB_UNDER_REVIEW
+        manual_rows = []
+        for task in manual_tasks:
+            row = [""] * len(VERIFICATION_HEADERS)
+            row[0] = task["company"]
+            row[5] = task.get("country", country)
+            row[8] = task["role"]
+            row[9] = task["role"]
+            row[14] = "manual_needed"
+            row[19] = "needs_review"
+            row[20] = task["task"]
+            manual_rows.append(row)
+        _ensure_headers(OUTPUT_SHEET_ID, TAB_UNDER_REVIEW, VERIFICATION_HEADERS)
+        _append_rows(OUTPUT_SHEET_ID, TAB_UNDER_REVIEW, manual_rows)
 
     elapsed = time.time() - start
+    total_accepted = sheet_counts_r1["accepted"] + sheet_counts_r2["accepted"]
+    total_review   = sheet_counts_r1["under_review"] + sheet_counts_r2["under_review"] + len(manual_tasks)
+    total_rejected = sheet_counts_r1["rejected"] + sheet_counts_r2["rejected"]
+
     logger.info(
         f"Pipeline complete: {company_name} | "
-        f"n8n_verified={len(verified_contacts)} "
-        f"searcher_verified={len(verified_searcher_contacts)} "
+        f"accepted={total_accepted} under_review={total_review} rejected={total_rejected} "
         f"manual={len(manual_tasks)} | elapsed={elapsed:.1f}s"
     )
 
     status_record["summary"] = {
         "n8n_contacts_received": len(contacts),
-        "veri_r1_valid": sum(1 for c in verified_contacts if c.get("verification_status") == "valid"),
-        "veri_r2_found": len(verified_searcher_contacts),
+        "accepted": total_accepted,
+        "under_review": total_review,
+        "rejected": total_rejected,
         "manual_needed": len(manual_tasks),
         "missing_roles": missing_roles,
         "covered_roles": gap_report.get("covered_roles", []),
         "coverage_pct": gap_report.get("coverage_percentage", 0),
         "elapsed_s": round(elapsed, 1),
     }
+
+
+# ── Auto-trigger: sheet poller (fires when n8n writes contacts to sheet) ─────
+
+_SHEET_POLL_INTERVAL = 30   # check every 30s
+_SHEET_POLL_TIMEOUT  = 600  # give up after 10 min
+
+
+async def _fire_pipeline_for_company(company_name: str, reason: str) -> None:
+    """Add company to the buffer (empty — pipeline reads from sheet) and flush."""
+    _n8n_pending_companies.pop(company_name, None)
+    task = _n8n_auto_trigger_tasks.pop(company_name, None)
+    if task and not task.done():
+        task.cancel()
+    logger.info(f"Firing pipeline for '{company_name}' — reason: {reason}")
+    async with _n8n_buffer_lock:
+        if company_name not in _n8n_buffer_contacts:
+            _n8n_buffer_contacts[company_name] = []
+        await _n8n_buffer_flush()
+
+
+async def _poll_sheet_until_ready(company_name: str) -> None:
+    """
+    Poll the First Clean List sheet every 30s.
+
+    n8n writes contacts one by one — fires the pipeline only once the count
+    has STABILISED (same value for 2 consecutive polls), meaning n8n is done.
+
+    Timeline example (n8n sends 8 contacts over ~90s):
+      t=30s  count=3  → growing, keep waiting
+      t=60s  count=7  → still growing, keep waiting
+      t=90s  count=8  → stable vs next poll?
+      t=120s count=8  → stable! fire pipeline.
+
+    Cancelled immediately if:
+    - n8n calls POST /api/n8n/done  (instant, no wait needed)
+    - contacts arrive via POST /api/n8n/contacts
+    """
+    loop = asyncio.get_running_loop()
+    elapsed = 0
+    last_count = 0   # count from previous poll
+    stable_count = 0  # count that has been stable for one full interval
+
+    while elapsed < _SHEET_POLL_TIMEOUT:
+        await asyncio.sleep(_SHEET_POLL_INTERVAL)
+        elapsed += _SHEET_POLL_INTERVAL
+
+        # Already handled by /api/n8n/done or /api/n8n/contacts
+        if company_name not in _n8n_pending_companies:
+            return
+
+        if not OUTPUT_SHEET_ID:
+            continue
+
+        try:
+            count = await loop.run_in_executor(
+                None, count_pending_contacts, OUTPUT_SHEET_ID, company_name
+            )
+        except Exception as e:
+            logger.warning(f"Sheet poll error for '{company_name}': {e}")
+            continue
+
+        logger.info(
+            f"Sheet poll '{company_name}': {count} contact(s) "
+            f"(prev={last_count}, elapsed={elapsed}s)"
+        )
+
+        if count == 0:
+            last_count = 0
+            stable_count = 0
+            continue
+
+        if count == last_count:
+            # Count hasn't changed since last poll — n8n has stopped writing
+            logger.info(
+                f"Sheet poll '{company_name}': count stable at {count} — "
+                f"n8n done writing, firing pipeline"
+            )
+            await _fire_pipeline_for_company(
+                company_name, f"sheet_stable ({count} contacts, {elapsed}s)"
+            )
+            return
+
+        # Count grew — n8n is still writing, keep waiting
+        last_count = count
+
+    # Timeout — fire anyway so we don't leave the company stuck forever
+    if company_name in _n8n_pending_companies:
+        logger.warning(
+            f"Sheet poll timeout ({_SHEET_POLL_TIMEOUT}s) for '{company_name}' — "
+            f"firing pipeline anyway (reads whatever is in sheet)"
+        )
+        await _fire_pipeline_for_company(company_name, "poll_timeout")
 
 
 # ── Buffer Timer ──────────────────────────────────────────────────────────────
@@ -683,7 +786,7 @@ const STEPS = {
   sheet_write:['Write to Sheets',           'Appending all verified results to Google Sheets'],
 };
 
-let company = '', pollId = null;
+let company = '', pollId = null, waitingForN8n = false;
 
 function badge(s){
   if(!s||s==='pending') return '<span class="badge b-pending">pending</span>';
@@ -712,41 +815,85 @@ async function poll(){
     const d = await fetch('/api/n8n/pipeline').then(r=>r.json());
     const res = (d.results||[]).find(r=>r.company===company)||(d.results||[])[0];
 
-    if(d.running && res){
+    const bufferHasOurs = (d.buffer?.companies||[]).includes(company);
+    const pipelineHasOurs = (d.companies||[]).includes(company);
+    const pendingInfo = (d.n8n_pending||{})[company];
+
+    // n8n webhook call failed
+    if(d.phase==='n8n_failed' && pendingInfo && pendingInfo.n8n_ok===false){
+      clearInterval(pollId); pollId=null;
+      const err = pendingInfo.error||'unknown error';
+      const noUrl = !pendingInfo.n8n_url_configured;
+      const msg = noUrl
+        ? 'N8N_WEBHOOK_URL is not set in .env — n8n was not called. Use "Inject test contact" to test manually.'
+        : 'n8n webhook failed: '+err+'. Check that n8n is running and N8N_WEBHOOK_URL is correct.';
+      document.getElementById('compStep').textContent = noUrl ? 'n8n not configured' : 'n8n error';
+      document.getElementById('helpers').style.display='block';
+      setAlert(msg,'red');
+      document.getElementById('runBtn').disabled=false;
+      document.getElementById('runBtn').textContent='▶ Run Pipeline';
+
+    // Pipeline is actively running for our company
+    } else if(d.running && res && pipelineHasOurs){
+      waitingForN8n = false;
       document.getElementById('compStep').textContent = 'Step: '+(d.current_step||'...');
       document.getElementById('steps').innerHTML = renderSteps(res.steps||{});
       document.getElementById('helpers').style.display='none';
       setAlert('<span class="spin"></span>Pipeline running…');
-    } else if(res && res.status==='done'){
-      clearInterval(pollId);
+
+    // Done
+    } else if(res && res.status==='done' && pipelineHasOurs){
+      clearInterval(pollId); pollId=null;
       document.getElementById('steps').innerHTML = renderSteps(res.steps||{});
       document.getElementById('compStep').textContent='Complete';
       document.getElementById('helpers').style.display='none';
-      setAlert('Done!','green');
+      setAlert('Done! Results written to Google Sheets.','green');
       showSummary(res.summary||{});
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='▶ Run Pipeline';
-    } else if(res && res.status && (res.status.startsWith('crashed')||res.status.startsWith('failed'))){
-      clearInterval(pollId);
+
+    // Failed/crashed
+    } else if(res && res.status && pipelineHasOurs &&
+              (res.status.startsWith('crashed')||res.status.startsWith('failed'))){
+      clearInterval(pollId); pollId=null;
       setAlert('Pipeline error: '+res.status,'red');
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='▶ Run Pipeline';
-    }
 
-    if(!d.running && d.buffer && d.buffer.timer_active){
+    // Our company is buffered — timer ticking
+    } else if(bufferHasOurs){
+      waitingForN8n = false;
+      const cnt = d.buffer.total_contacts;
       document.getElementById('helpers').style.display='block';
-      setAlert('Waiting for n8n contacts… ('+d.buffer.total_contacts+' buffered so far)');
+      document.getElementById('compStep').textContent='Contacts buffered — waiting for silence timer…';
+      setAlert('<span class="spin"></span>'+cnt+' contact'+(cnt!==1?'s':'')+' buffered. Pipeline fires in ~'+d.buffer.timeout_secs+'s of silence.');
+
+    // n8n received trigger — polling sheet for contacts
+    } else if(d.phase==='waiting_n8n' && pendingInfo){
+      waitingForN8n = false;
+      const pollIn = pendingInfo.next_poll_in_secs||0;
+      const secs = pendingInfo.waiting_secs||0;
+      document.getElementById('helpers').style.display='block';
+      document.getElementById('compStep').textContent='n8n is writing contacts to sheet — checking every 30s…';
+      setAlert('<span class="spin"></span>Trigger sent to n8n ✓ — checking sheet for contacts (next check in '+pollIn+'s, waited '+secs+'s so far)');
+
+    // Still waiting for n8n submission to complete
+    } else if(waitingForN8n){
+      document.getElementById('helpers').style.display='block';
+      document.getElementById('compStep').textContent='Sending to n8n…';
+      setAlert('<span class="spin"></span>Trigger sent. Waiting for n8n to respond…');
     }
+    // If none of the above — silent, don't spam logs
   }catch(e){console.error(e)}
 }
 
 function showSummary(s){
   const stats=[
     [s.n8n_contacts_received??'-','n8n Received'],
-    [s.veri_r1_valid??'-','R1 Valid'],
-    [s.veri_r2_found??'-','R2 Found'],
-    [s.manual_needed??'-','Manual Needed'],
-    [(s.coverage_pct!=null?s.coverage_pct+'%':'-'),'Coverage'],
+    [s.accepted??'-','Accepted'],
+    [s.under_review??'-','Under Review'],
+    [s.rejected??'-','Rejected'],
+    [s.manual_needed??'-','Manual'],
     [(s.elapsed_s!=null?s.elapsed_s+'s':'-'),'Time'],
   ];
   document.getElementById('stats').innerHTML=stats.map(
@@ -787,11 +934,24 @@ document.getElementById('frm').addEventListener('submit',async e=>{
   document.getElementById('steps').innerHTML=renderSteps({});
 
   try{
-    await fetch('/api/trigger',{method:'POST',
+    const resp = await fetch('/api/trigger',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    setAlert('Triggered. Waiting for n8n to send contacts back…');
-    document.getElementById('helpers').style.display='block';
-    document.getElementById('runBtn').textContent='Running…';
+    const result = await resp.json();
+    if(!resp.ok) throw new Error(result.detail||'Trigger failed');
+
+    if(result.status==='warning'){
+      // N8N_WEBHOOK_URL not set — show error but still allow manual inject
+      setAlert('&#9888; '+result.message,'red');
+      document.getElementById('helpers').style.display='block';
+      document.getElementById('compStep').textContent='n8n not configured';
+      document.getElementById('runBtn').disabled=false;
+      document.getElementById('runBtn').textContent='▶ Run Pipeline';
+      return;
+    }
+
+    setAlert('<span class="spin"></span>Trigger sent to n8n ✓ — waiting for contacts…');
+    document.getElementById('runBtn').textContent='Waiting for n8n…';
+    waitingForN8n = true;
   }catch(err){
     setAlert('Trigger failed: '+err.message,'red');
     document.getElementById('runBtn').disabled=false;
@@ -799,8 +959,17 @@ document.getElementById('frm').addEventListener('submit',async e=>{
     return;
   }
 
+  // Poll every 5s while waiting for n8n — switches to 3s once pipeline starts
   if(pollId) clearInterval(pollId);
-  pollId=setInterval(poll,2000);
+  pollId=setInterval(async()=>{
+    await poll();
+    // Speed up polling once pipeline is actually running
+    const d = await fetch('/api/n8n/pipeline').then(r=>r.json()).catch(()=>({}));
+    if(d.running && pollId){
+      clearInterval(pollId);
+      pollId=setInterval(poll,3000);
+    }
+  },5000);
 });
 </script>
 </body>
@@ -852,7 +1021,8 @@ async def trigger_company(payload: TriggerPayload):
 
     n8n will respond asynchronously by POSTing contacts to /api/n8n/contacts.
     """
-    _company_metadata[payload.company_name] = {
+    meta = {
+        "company_name": payload.company_name,
         "country": payload.country,
         "domain": payload.domain,
         "account_type": payload.account_type,
@@ -864,6 +1034,14 @@ async def trigger_company(payload: TriggerPayload):
         "sdr_assigned": payload.sdr_assigned,
         "row": payload.row,
     }
+    _company_metadata[payload.company_name] = meta
+
+    # Write to Target Accounts sheet immediately
+    if OUTPUT_SHEET_ID:
+        try:
+            write_target_account(OUTPUT_SHEET_ID, meta)
+        except Exception as e:
+            logger.warning(f"Could not write to Target Accounts: {e}")
 
     n8n_payload = {
         "sheetName": "Target Accounts",
@@ -879,13 +1057,42 @@ async def trigger_company(payload: TriggerPayload):
         "country": payload.country,
     }
 
+    # Track as pending — waiting for n8n to send contacts back
+    _n8n_pending_companies[payload.company_name] = {
+        "triggered_at": time.time(),
+        "n8n_ok": None,  # None = request in-flight, True = n8n accepted, False = failed
+        "error": None,
+        "n8n_url_configured": bool(N8N_WEBHOOK_URL),
+    }
+
     # Fire-and-forget — do not block the HTTP response
-    asyncio.create_task(submit_to_n8n(n8n_payload))
+    asyncio.create_task(submit_to_n8n(n8n_payload, company_name=payload.company_name))
+
+    # Sheet poller: every 30s check First Clean List for contacts n8n wrote.
+    # Fires pipeline automatically when contacts appear — no fixed delay.
+    # Cancelled immediately if n8n calls /api/n8n/done or posts to /api/n8n/contacts.
+    poll_task = asyncio.create_task(
+        _poll_sheet_until_ready(payload.company_name)
+    )
+    _n8n_auto_trigger_tasks[payload.company_name] = poll_task
 
     logger.info(
         f"Triggered n8n for: {payload.company_name} ({payload.country}) "
-        f"domain={payload.domain} account_type={payload.account_type}"
+        f"domain={payload.domain} account_type={payload.account_type} "
+        f"| polling sheet every {_SHEET_POLL_INTERVAL}s for contacts"
     )
+
+    if not N8N_WEBHOOK_URL:
+        return RunResponse(
+            status="warning",
+            company=payload.company_name,
+            message=(
+                f"N8N_WEBHOOK_URL is not configured — n8n was NOT called. "
+                f"Set N8N_WEBHOOK_URL in your .env file. "
+                f"You can still inject contacts manually via POST /api/n8n/contacts."
+            ),
+        )
+
     return RunResponse(
         status="triggered",
         company=payload.company_name,
@@ -974,6 +1181,14 @@ async def n8n_contacts(request: Request):
             companies_seen.add(c["company_name"])
 
     if buffered_count > 0:
+        # Remove from pending and cancel auto-trigger — contacts have arrived via API
+        for co in companies_seen:
+            _n8n_pending_companies.pop(co, None)
+            task = _n8n_auto_trigger_tasks.pop(co, None)
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"Auto-trigger cancelled for '{co}' — contacts received via API")
+
         async with _n8n_buffer_lock:
             await _n8n_buffer_reset_timer()
             total_buffered = sum(len(v) for v in _n8n_buffer_contacts.values())
@@ -1026,6 +1241,47 @@ async def n8n_contacts(request: Request):
 
 # ── Management Endpoints ──────────────────────────────────────────────────────
 
+@app.post("/api/n8n/done")
+async def n8n_done(request: Request):
+    """
+    n8n calls this endpoint at the END of its workflow, once it has finished
+    writing all contacts to the First Clean List sheet.
+
+    This fires the pipeline immediately — no polling delay.
+
+    Payload (from n8n): {"company_name": "Britannia Industries"}
+    or just: {"Company_Name": "Britannia Industries"}
+
+    In n8n: add an HTTP Request node at the very end of the workflow:
+      Method: POST
+      URL:    http://YOUR_SERVER/api/n8n/done
+      Body:   { "company_name": "{{ $('Trigger').item.json.Company_Name }}" }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Accept both snake_case and PascalCase field names
+    company_name = (
+        body.get("company_name") or body.get("Company_Name") or ""
+    ).strip()
+
+    if not company_name:
+        raise HTTPException(status_code=400, detail="company_name is required")
+
+    logger.info(f"n8n done signal received for '{company_name}' — firing pipeline immediately")
+
+    # Cancel the sheet poller since n8n told us it's done
+    await _fire_pipeline_for_company(company_name, "n8n_done_signal")
+
+    return {
+        "status": "ok",
+        "company": company_name,
+        "message": f"Pipeline started for '{company_name}'",
+    }
+
+
 @app.post("/api/n8n/flush")
 async def n8n_flush():
     """
@@ -1074,19 +1330,66 @@ async def n8n_pipeline_status():
     """
     Live per-company pipeline progress.
     Poll this endpoint from a frontend to show real-time status.
+
+    phase values:
+      idle          — nothing triggered yet
+      waiting_n8n   — trigger sent to n8n, waiting for contacts to come back
+      n8n_failed    — n8n webhook call failed (check n8n_pending for error)
+      buffering     — contacts received from n8n, timer counting down before pipeline fires
+      running       — pipeline chain is executing (veri_r1 / searcher / veri_r2)
+      done          — last pipeline run completed (results available)
     """
+    buffer_companies = sorted(_n8n_buffer_contacts.keys())
+    buffer_total = sum(len(v) for v in _n8n_buffer_contacts.values())
+    timer_active = _n8n_buffer_timer is not None and not _n8n_buffer_timer.done()
+
+    # Pending = triggered but contacts not yet received
+    pending = dict(_n8n_pending_companies)
+    any_pending = bool(pending)
+    any_failed = any(p.get("n8n_ok") is False for p in pending.values())
+
+    if _n8n_chain_running:
+        phase = "running"
+    elif timer_active or buffer_total > 0:
+        phase = "buffering"
+    elif any_failed:
+        phase = "n8n_failed"
+    elif any_pending:
+        phase = "waiting_n8n"
+    elif _n8n_pipeline_results:
+        phase = "done"
+    else:
+        phase = "idle"
+
     return {
+        "phase": phase,
         "running": _n8n_chain_running,
         "current_company": _n8n_chain_current_company,
         "current_step": _n8n_chain_current_step,
         "companies": _n8n_pipeline_companies,
         "results": _n8n_pipeline_results,
+        "n8n_pending": {
+            co: {
+                "n8n_ok": p.get("n8n_ok"),
+                "error": p.get("error"),
+                "n8n_url_configured": p.get("n8n_url_configured"),
+                "waiting_secs": round(time.time() - p["triggered_at"], 0),
+                "next_poll_in_secs": max(
+                    0,
+                    round(
+                        _SHEET_POLL_INTERVAL - ((time.time() - p["triggered_at"]) % _SHEET_POLL_INTERVAL),
+                        0,
+                    ),
+                ),
+                "note": "pipeline fires once sheet contact count is stable for one full poll interval",
+            }
+            for co, p in pending.items()
+        },
         "buffer": {
-            "companies": sorted(_n8n_buffer_contacts.keys()),
-            "total_contacts": sum(len(v) for v in _n8n_buffer_contacts.values()),
-            "timer_active": (
-                _n8n_buffer_timer is not None and not _n8n_buffer_timer.done()
-            ),
+            "companies": buffer_companies,
+            "total_contacts": buffer_total,
+            "timer_active": timer_active,
+            "timeout_secs": _N8N_BUFFER_TIMEOUT,
         },
     }
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from clients.openai_client import call_gpt5
 from clients.unipile_client import fetch_linkedin_profile, extract_username, extract_profile_fields
+from clients.zerobounce_client import verify_email as zb_verify_email, is_valid as zb_is_valid
 from utils.json_parser import parse_gpt_json
 
 logger = logging.getLogger(__name__)
@@ -60,33 +61,85 @@ OUR TARGET ROLE LIST for {account_type}:
 
 CHECK:
 
-1. COMPANY MATCH: Does their CURRENT role match {company_name}? Account for subsidiaries, brand names, local entity names:
-   - "FEMSA Comercio" = "OXXO"
-   - "Hindustan Unilever" = "Unilever India"
-   - "PT Coca-Cola Amatil Indonesia" = "CCAI"
-   - "Arca Continental" includes "AC Bebidas", "Tonicorp", "Lindley"
+1. COMPANY MATCH: Does their CURRENT role match {company_name}?
+
+   CONFIRMED = active LinkedIn role clearly shows {company_name} (or a known subsidiary/brand).
+   UNCONFIRMED ≠ DEPARTED — if LinkedIn data is empty, sparse, or outdated, that is NOT evidence
+   the person left. Small companies, startups, and founders often have incomplete LinkedIn profiles.
+   Set current_company_confirmed: true unless LinkedIn ACTIVELY shows a DIFFERENT company as
+   their current primary role.
+
+   Account for subsidiaries and brand names:
+   - "FEMSA Comercio" = "OXXO", "Hindustan Unilever" = "Unilever India"
+   - "PT Coca-Cola Amatil Indonesia" = "CCAI", "Arca Continental" includes "AC Bebidas"
    - "GEPP" = "PepsiCo Mexico bottler"
-   - Bepensa operates "Bepensa Bebidas", "Bepensa Industrial", etc.
-   If most recent role is at a DIFFERENT company, they likely left.
 
-2. ROLE RELEVANCE: Does their title match any target role? Consider titles in ANY language:
-   - Spanish: "Director de Ventas" = "Sales Director", "Gerente de TI" = "IT Manager", "Jefe de Operaciones" = "Head of Operations"
-   - Indonesian: "Kepala IT" = "IT Head", "Direktur Penjualan" = "Sales Director"
-   - Arabic: "مدير المبيعات" = "Sales Director", "مدير تقنية المعلومات" = "IT Director"
-   - Hindi: "बिक्री निदेशक" = "Sales Director"
-   - Thai: "ผู้อำนวยการฝ่ายขาย" = "Sales Director"
-   Return the matched ENGLISH role AND the tier it belongs to.
+   Only set current_company_confirmed: false if LinkedIn CLEARLY shows a different company
+   as their primary current employer — not just because the data is missing or ambiguous.
 
-3. CROSS-REFERENCE: Is this person mentioned in the scraped company intel? Do web sources confirm or contradict?
+2. TITLE PARSING — do this BEFORE role matching:
 
-4. STALENESS: If they recently started at a DIFFERENT company, flag "possibly_departed".
+   Titles often contain noise. Extract the core role first:
 
-5. SENIORITY: Entry-level/intern/junior? Flag if yes.
+   a) COMPOUND TITLES — take the highest-seniority component:
+      - "CEO & Co-Founder" → evaluate as "CEO"
+      - "Co-Founder and Chief Technology Officer" → evaluate as "CTO"
+      - "Co-Founder and Technology Head" → evaluate as "Head of Technology / CTO"
+      - "Managing Director & Founder" → evaluate as "Managing Director"
+      - Rule: "Co-Founder", "Founder", "Partner" combined with a C-suite/Director title →
+        the C-suite/Director title is the primary role for matching purposes.
 
-6. MULTIPLE ROLES: Concurrent roles at multiple companies? Note primary.
+   b) ROLE-AT-COMPANY FORMAT — strip the company part:
+      - "COO- Peter England" → evaluate as "COO" (ignore everything after "- ")
+      - "COO, Sunlight Resources Ltd" → evaluate as "COO" (ignore everything after ", ")
+      - "Head of Sales @ Pladis" → evaluate as "Head of Sales"
+      - Pattern: if title contains " - ", " @ ", " at " followed by a company name → strip it.
+
+   c) SCOPE/GEOGRAPHIC MODIFIERS — do not change the role type:
+      - "Global Sales Director" = "Sales Director"
+      - "Regional COO" = "COO"
+      - "National Sales Head" = "Head of Sales"
+      - "Senior Sales Director" = "Sales Director"
+      - "Group CFO" = "CFO"
+      - The scope prefix (Global/Regional/National/Senior/Group/Corporate) describes coverage,
+        not a different role. Match against the base role.
+
+3. ROLE MATCH — apply after title parsing above:
+
+   ONLY set matched_role if the extracted core role is genuinely the same function AND seniority
+   as something in the target list.
+
+   SENIORITY IS NOT INTERCHANGEABLE:
+   - "Manager" ≠ "Director" ≠ "Head" ≠ "VP" ≠ "Chief"
+   - "Sales Manager" does NOT match "Sales Director / VP Sales / SVP Sales"
+   - "IT Manager" does NOT match "Head of IT / IT Director / CIO"
+   - A Manager-level role reporting to the Director we want is NOT a match
+
+   WHAT COUNTS AS A MATCH:
+   - Same title in another language (e.g. "Director de Ventas" = "Sales Director")
+   - Common abbreviations (e.g. "CIO" = "Chief Information Officer" = "Head of IT / IT Director / CIO")
+   - Equivalent seniority + function (e.g. "Chief Sales Officer" = "Sales Director / VP Sales")
+   - Compound title after extraction (e.g. "CEO & Co-Founder" → extracted "CEO" matches "CEO / MD / President")
+
+   WHAT IS NOT A MATCH — return matched_role: null and role_tier: "none":
+   - Lower seniority (Manager when we want Director/Head/VP/Chief)
+   - Adjacent function (e.g. "HR Director" does not match any sales/IT/ops target role)
+   - When in doubt — return null. Do NOT force a match.
+
+4. CROSS-REFERENCE: Is this person in the scraped company intel? Do web sources confirm or contradict?
+
+5. STALENESS: Only flag "possibly_departed" if LinkedIn ACTIVELY shows a different company
+   as the current primary role — not if data is simply missing.
+
+6. MULTIPLE ROLES / SIDE VENTURES:
+   - Senior professionals commonly hold a corporate role AND run a startup/advisory/board seat.
+   - If the person holds a senior role at {company_name} AND has a side venture → still employed.
+   - Signals of side venture (not primary job): "Founder", "Co-Founder", "Advisor", "Board Member",
+     "Independent Consultant", "Angel Investor" — these almost never replace a corporate role.
+   - When in doubt and {company_name} role appears active → keep current_company_confirmed: true.
 
 Return ONLY this JSON:
-{{"status": "valid|invalid|needs_review", "current_company_confirmed": true, "matched_role": "English role name or null", "role_tier": "final_decision_maker|key_decision_maker|key_influencer|gate_keeper|none", "confidence": 0.85, "issues": [], "reason": "one sentence"}}"""
+{{"status": "valid|invalid|needs_review", "current_company_confirmed": true, "matched_role": "exact target role string from the list above, or null if no genuine match", "role_tier": "final_decision_maker|key_decision_maker|key_influencer|gate_keeper|none", "confidence": 0.85, "issues": [], "reason": "one sentence explaining the role match decision"}}"""
 
     raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
     result = parse_gpt_json(raw)
@@ -217,16 +270,58 @@ def verify_contacts(
 
             gpt_result["web_verification"] = web_result
 
-        # Step 4: Compile (emails already verified upstream — skip ZeroBounce)
+        role_tier = gpt_result.get("role_tier", "none")
+
+        # Hard rule: if role does not match ANY target role tier → Rejected immediately.
+        # No exceptions — junior/lower-level roles are never Accepted or Under Review.
+        if role_tier == "none" or not gpt_result.get("matched_role"):
+            status = "invalid"
+            issues = gpt_result.get("issues", [])
+            if "no_role_match" not in issues:
+                issues = issues + ["no_role_match"]
+            gpt_result["issues"] = issues
+            logger.info(
+                f"  Rejected (no role match): "
+                f"{contact.get('first_name')} {contact.get('last_name')} | "
+                f"title='{contact.get('job_title')}'"
+            )
+
+        # Step 4: ZeroBounce email verification (only if contact has an email)
+        email = contact.get("email", "")
+        email_status = "no_email"
+        if email and "@" in email:
+            try:
+                zb_result = zb_verify_email(email)
+                if zb_is_valid(zb_result):
+                    email_status = "valid"
+                else:
+                    zb_stat = zb_result.get("status", "unknown").lower()
+                    email_status = zb_stat  # e.g. "invalid", "catch-all", "unknown", "spamtrap"
+                    # Downgrade to needs_review if valid contact but bad email
+                    if status == "valid" and zb_stat in ("invalid", "spamtrap", "abuse"):
+                        status = "needs_review"
+                        issues = gpt_result.get("issues", []) + ["email_invalid"]
+                        gpt_result["issues"] = issues
+                        logger.info(
+                            f"  Email invalid ({zb_stat}): {email} — downgraded to needs_review"
+                        )
+                logger.info(f"  ZeroBounce {email}: {email_status}")
+            except Exception as e:
+                logger.warning(f"ZeroBounce failed for {email}: {e}")
+                email_status = "unverified"
+
+        # Step 5: Compile
         result.update({
             "matched_role": gpt_result.get("matched_role"),
-            "role_tier": gpt_result.get("role_tier", "none"),
+            "role_tier": role_tier,
+            "title_match": "yes" if gpt_result.get("matched_role") else "no",
             "verification_status": status,
             "confidence": confidence,
             "company_confirmed": gpt_result.get("current_company_confirmed", False),
-            "email_status": "pre-verified",
+            "email_status": email_status,
             "issues": gpt_result.get("issues", []),
-            "source": "n8n",
+            "reason": gpt_result.get("reason", ""),
+            "source": contact.get("source", "n8n"),
         })
 
         if status == "valid":
