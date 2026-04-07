@@ -27,12 +27,14 @@ from clients.clay_client import enrich as clay_enrich
 from utils.json_parser import parse_gpt_json
 from config import MATCH_CONFIDENCE_THRESHOLD
 
+import io
+_stdout_utf8 = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("logs/britannia_full.log"),
+        logging.StreamHandler(_stdout_utf8),
+        logging.FileHandler("logs/britannia_full.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)

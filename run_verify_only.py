@@ -2,7 +2,7 @@
 Verifier only — rows 294-335 of 'First Clean List'.
 Writes O-U back in-place. Stops after gap report. No searcher.
 """
-import sys, json, logging, os
+import sys, json, logging, os, io
 sys.path.insert(0, ".")
 os.makedirs("logs", exist_ok=True)
 
@@ -11,10 +11,11 @@ from clients.unipile_client import fetch_linkedin_profile, extract_username, ext
 from clients.openai_client import call_gpt5
 from utils.json_parser import parse_gpt_json
 
+_stdout_utf8 = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("logs/verify_only.log")],
+    handlers=[logging.StreamHandler(_stdout_utf8), logging.FileHandler("logs/verify_only.log", encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 

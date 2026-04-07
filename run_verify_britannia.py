@@ -6,6 +6,7 @@ import sys
 import json
 import logging
 import time
+import io
 
 sys.path.insert(0, ".")
 
@@ -14,10 +15,11 @@ from clients.unipile_client import fetch_linkedin_profile, extract_username, ext
 from clients.openai_client import call_gpt5
 from utils.json_parser import parse_gpt_json
 
+_stdout_utf8 = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("logs/verify_britannia.log")],
+    handlers=[logging.StreamHandler(_stdout_utf8), logging.FileHandler("logs/verify_britannia.log", encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 
