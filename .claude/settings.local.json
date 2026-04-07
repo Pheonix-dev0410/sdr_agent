@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
-      "Bash(python -c \"import main; print\\('OK'\\)\")"
+      "Bash(python -c \"import main; print\\('OK'\\)\")",
+      "Bash(uvicorn main:app --port 8000)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl -s http://localhost:8000/api/config/check)",
+      "Bash(curl -s -X POST http://localhost:8000/api/n8n/test-send)",
+      "Bash(curl -s -X POST http://localhost:8000/api/trigger -H \"Content-Type: application/json\" -d \"{\\\\\"company_name\\\\\":\\\\\"Britannia Industries\\\\\",\\\\\"country\\\\\":\\\\\"India\\\\\",\\\\\"domain\\\\\":\\\\\"britannia.co.in\\\\\",\\\\\"account_type\\\\\":\\\\\"manufacturer\\\\\",\\\\\"email_format\\\\\":\\\\\"firstname.lastname\\\\\"}\")",
+      "Bash(curl -s -X POST http://localhost:8000/api/n8n/contacts -H \"Content-Type: application/json\" -d \"[{\\\\\"first_name\\\\\":\\\\\"Vipin\\\\\",\\\\\"last_name\\\\\":\\\\\"Kataria\\\\\",\\\\\"job_title\\\\\":\\\\\"Chief Commercial Officer\\\\\",\\\\\"email\\\\\":\\\\\"v.kataria@britindia.com\\\\\",\\\\\"company_name\\\\\":\\\\\"Britannia Industries\\\\\",\\\\\"country\\\\\":\\\\\"India\\\\\",\\\\\"domain\\\\\":\\\\\"britannia.co.in\\\\\",\\\\\"linkedin_url\\\\\":\\\\\"https://www.linkedin.com/in/vipin-kataria\\\\\"}]\")",
+      "Bash(curl -s http://localhost:8000/api/n8n/debug)",
+      "Bash(curl -s -X POST http://localhost:8000/api/n8n/flush)",
+      "Bash(curl -s http://localhost:8000/api/n8n/pipeline)"
     ]
   }
 }

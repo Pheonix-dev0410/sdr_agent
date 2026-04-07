@@ -76,12 +76,27 @@ _company_metadata: dict[str, dict] = {}
 
 # ── Field Normalization ───────────────────────────────────────────────────────
 
+_NULL_VALUES = {"null", "none", "n/a", "na", "undefined", "-", ""}
+
+
 def _extract_field(d: dict, *keys: str) -> str:
-    """Return the first non-empty string found among the given keys."""
+    """
+    Return the first non-empty string found among the given keys.
+    - Case-insensitive key matching
+    - Treats spaces/hyphens as underscores in key names
+    - Filters out null-ish string values: "null", "none", "n/a", "-", etc.
+    """
+    # Build a normalized lookup once
+    normalized = {k.lower().replace(" ", "_").replace("-", "_"): v for k, v in d.items()}
+
     for k in keys:
-        v = d.get(k)
-        if v and str(v).strip():
-            return str(v).strip()
+        nk = k.lower().replace(" ", "_").replace("-", "_")
+        v = normalized.get(nk)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s.lower() not in _NULL_VALUES:
+            return s
     return ""
 
 
@@ -139,8 +154,15 @@ def _normalize_contact(raw: dict) -> dict:
                 first_name = parts[0].capitalize()
                 last_name = " ".join(p.capitalize() for p in parts[1:])
 
+    normalized_name = _extract_field(
+        raw,
+        "normalized_name", "parent_company", "normalized_company_name",
+        "parent_company_name", "parent_group",
+    ) or company
+
     return {
         "company_name": company,
+        "normalized_name": normalized_name,
         "domain": domain,
         "account_type": _extract_field(raw, "account_type", "type"),
         "account_size": _extract_field(raw, "account_size", "size", "company_size"),
@@ -271,8 +293,11 @@ def _run_company_pipeline(
         _n8n_chain_current_step = name
         status_record["steps"][name] = state
 
-    # ── a. Company intel (Firecrawl + GPT web search) ─────────────────────────
-    _step("company_intel")
+    # ── Step veri_r1: Company intel + verify n8n contacts + gap report ────────
+    # (company intel runs inside veri_r1 as preparation context)
+    _step("veri_r1")
+    verified_contacts: list[dict] = []
+    gap_report: dict = {}
     try:
         company_intel = scrape_company_intel(
             company_name,
@@ -280,10 +305,8 @@ def _run_company_pipeline(
             country,
             account_type,
         )
-        _step("company_intel", "done")
     except Exception as e:
         logger.error(f"Company intel failed for {company_name}: {e}")
-        _step("company_intel", f"failed: {e}")
         company_intel = {
             "scraped_content": {},
             "people_found": [],
@@ -291,26 +314,20 @@ def _run_company_pipeline(
             "scraped_urls": [],
         }
 
-    # ── b. Verify n8n contacts + produce gap report ───────────────────────────
-    _step("verify_n8n")
-    verified_contacts: list[dict] = []
-    gap_report: dict = {}
     try:
         if contacts:
             verify_result = verify_contacts(company_context, contacts, company_intel)
             verified_contacts = verify_result["verified_contacts"]
             gap_report = verify_result["gap_report"]
             logger.info(
-                f"Verification complete: valid={verify_result['valid_count']} "
+                f"Veri R1 complete: valid={verify_result['valid_count']} "
                 f"invalid={verify_result['invalid_count']} "
                 f"needs_review={verify_result['needs_review_count']}"
             )
         else:
-            # n8n sent nothing — treat all target roles as missing
             logger.info("No n8n contacts received — will search all target roles")
-            all_roles = TARGET_ROLES
-            missing_all = all_roles.get(
-                account_type.lower(), all_roles.get("distributor", [])
+            missing_all = TARGET_ROLES.get(
+                account_type.lower(), TARGET_ROLES.get("distributor", [])
             )
             gap_report = {
                 "missing_roles": missing_all,
@@ -318,10 +335,10 @@ def _run_company_pipeline(
                 "coverage_percentage": 0,
                 "potential_leads_from_web": [],
             }
-        _step("verify_n8n", "done")
+        _step("veri_r1", "done")
     except Exception as e:
-        logger.error(f"Verification failed for {company_name}: {e}")
-        _step("verify_n8n", f"failed: {e}")
+        logger.error(f"Veri R1 failed for {company_name}: {e}")
+        _step("veri_r1", f"failed: {e}")
         gap_report = {
             "missing_roles": [],
             "covered_roles": [],
@@ -329,12 +346,12 @@ def _run_company_pipeline(
             "potential_leads_from_web": [],
         }
 
-    # ── c+d. Searcher waterfall for missing roles ─────────────────────────────
+    # ── Step searcher: Waterfall search for missing roles ─────────────────────
     missing_roles: list[str] = gap_report.get("missing_roles", [])
     potential_leads: list[dict] = gap_report.get("potential_leads_from_web", [])
 
     _step("searcher")
-    new_contacts: list[dict] = []
+    raw_searcher_contacts: list[dict] = []
     manual_tasks: list[dict] = []
     try:
         if missing_roles:
@@ -348,7 +365,7 @@ def _run_company_pipeline(
                 company_intel,
                 potential_leads,
             )
-            new_contacts = search_result["new_contacts"]
+            raw_searcher_contacts = search_result["new_contacts"]
             manual_tasks = search_result["manual_tasks"]
             logger.info(
                 f"Searcher complete: found={search_result['total_found']} "
@@ -361,18 +378,36 @@ def _run_company_pipeline(
         logger.error(f"Searcher failed for {company_name}: {e}")
         _step("searcher", f"failed: {e}")
 
-    # ── e. Deduplicate (new searcher contacts vs already-verified n8n contacts) ─
-    all_new_contacts = deduplicate(new_contacts, verified_contacts)
+    # ── Step veri_r2: Verify searcher-found contacts ──────────────────────────
+    _step("veri_r2")
+    verified_searcher_contacts: list[dict] = []
+    try:
+        deduped_searcher = deduplicate(raw_searcher_contacts, verified_contacts)
+        if deduped_searcher:
+            logger.info(f"Veri R2: verifying {len(deduped_searcher)} searcher contacts")
+            r2_result = verify_contacts(company_context, deduped_searcher, company_intel)
+            verified_searcher_contacts = r2_result["verified_contacts"]
+            logger.info(
+                f"Veri R2 complete: valid={r2_result['valid_count']} "
+                f"invalid={r2_result['invalid_count']} "
+                f"needs_review={r2_result['needs_review_count']}"
+            )
+        else:
+            logger.info("Veri R2: no new searcher contacts to verify")
+        _step("veri_r2", "done")
+    except Exception as e:
+        logger.error(f"Veri R2 failed for {company_name}: {e}")
+        _step("veri_r2", f"failed: {e}")
+        verified_searcher_contacts = deduped_searcher if deduped_searcher else []
 
-    # ── f. Write to Google Sheets ─────────────────────────────────────────────
+    # ── Step sheet_write: Write all results to Google Sheets ──────────────────
+    all_output_contacts = verified_contacts + verified_searcher_contacts
+
     _step("sheet_write")
     try:
         rows: list[list] = [SHEET_HEADERS]
 
-        for contact in verified_contacts:
-            rows.append(contact_to_row(contact, company_name, country))
-
-        for contact in all_new_contacts:
+        for contact in all_output_contacts:
             rows.append(contact_to_row(contact, company_name, country))
 
         if manual_tasks:
@@ -403,14 +438,15 @@ def _run_company_pipeline(
     elapsed = time.time() - start
     logger.info(
         f"Pipeline complete: {company_name} | "
-        f"n8n_verified={len(verified_contacts)} searcher_found={len(all_new_contacts)} "
+        f"n8n_verified={len(verified_contacts)} "
+        f"searcher_verified={len(verified_searcher_contacts)} "
         f"manual={len(manual_tasks)} | elapsed={elapsed:.1f}s"
     )
 
     status_record["summary"] = {
         "n8n_contacts_received": len(contacts),
-        "verified": len(verified_contacts),
-        "searcher_found": len(all_new_contacts),
+        "veri_r1_valid": sum(1 for c in verified_contacts if c.get("verification_status") == "valid"),
+        "veri_r2_found": len(verified_searcher_contacts),
         "manual_needed": len(manual_tasks),
         "missing_roles": missing_roles,
         "covered_roles": gap_report.get("covered_roles", []),
@@ -474,9 +510,9 @@ async def _n8n_buffer_flush() -> None:
                 "contacts_received": len(buffered[co]),
                 "status": "pending",
                 "steps": {
-                    "company_intel": "pending",
-                    "verify_n8n": "pending",
+                    "veri_r1": "pending",
                     "searcher": "pending",
+                    "veri_r2": "pending",
                     "sheet_write": "pending",
                 },
                 "summary": {},
@@ -641,10 +677,10 @@ input:focus,select:focus{outline:none;border-color:#6366f1}
 
 <script>
 const STEPS = {
-  company_intel: ['Company Intel',    'Firecrawl + GPT web search for leadership'],
-  verify_n8n:    ['Verify n8n Contacts','Unipile LinkedIn fetch + GPT check'],
-  searcher:      ['Searcher Waterfall','Unipile → Apollo → Clay → GPT web'],
-  sheet_write:   ['Write to Sheets',  'Appending results to Google Sheets'],
+  veri_r1:    ['Verify R1 — n8n Contacts', 'Company intel + Unipile LinkedIn fetch + GPT check'],
+  searcher:   ['Searcher Waterfall',        'Unipile SalesNav → Apollo → Clay → GPT web'],
+  veri_r2:    ['Verify R2 — Searcher',      'Verify searcher-found contacts via Unipile + GPT'],
+  sheet_write:['Write to Sheets',           'Appending all verified results to Google Sheets'],
 };
 
 let company = '', pollId = null;
@@ -706,9 +742,9 @@ async function poll(){
 
 function showSummary(s){
   const stats=[
-    [s.n8n_contacts_received??'-','n8n Contacts'],
-    [s.verified??'-','Verified'],
-    [s.searcher_found??'-','Searcher Found'],
+    [s.n8n_contacts_received??'-','n8n Received'],
+    [s.veri_r1_valid??'-','R1 Valid'],
+    [s.veri_r2_found??'-','R2 Found'],
     [s.manual_needed??'-','Manual Needed'],
     [(s.coverage_pct!=null?s.coverage_pct+'%':'-'),'Coverage'],
     [(s.elapsed_s!=null?s.elapsed_s+'s':'-'),'Time'],
@@ -943,16 +979,26 @@ async def n8n_contacts(request: Request):
             total_buffered = sum(len(v) for v in _n8n_buffer_contacts.values())
             buffer_companies = sorted(_n8n_buffer_contacts.keys())
 
+        # Store a sample raw + normalized pair for debugging field mapping
+        first_raw = next(
+            (r for r in raw_contacts if isinstance(r, dict)), {}
+        )
+        first_norm = _normalize_contact(first_raw) if first_raw else {}
+
         _n8n_last_received.clear()
         _n8n_last_received.update({
             "received_at": timestamp,
+            "raw_contacts_count": len(raw_contacts),
             "buffered_this_batch": buffered_count,
             "skipped": skipped,
             "skip_reasons": skip_reasons,
             "companies_this_batch": sorted(companies_seen),
             "buffer_companies": buffer_companies,
             "buffer_total_contacts": total_buffered,
+            "buffer_per_company": {k: len(v) for k, v in _n8n_buffer_contacts.items()},
             "buffer_timeout_secs": _N8N_BUFFER_TIMEOUT,
+            "sample_raw": first_raw,
+            "sample_normalized": first_norm,
         })
 
         skip_msg = (
@@ -1048,14 +1094,69 @@ async def n8n_pipeline_status():
 @app.get("/api/n8n/debug")
 async def n8n_debug():
     """
-    Shows the last received contact batch and how fields were mapped.
+    Shows the last received contact batch including raw + normalized sample.
     Use this to diagnose n8n field-name mismatches.
     """
-    return (
-        dict(_n8n_last_received)
-        if _n8n_last_received
-        else {"message": "No data received yet"}
+    if not _n8n_last_received:
+        return {"message": "No data received yet"}
+    return dict(_n8n_last_received)
+
+
+@app.post("/api/n8n/retry")
+async def n8n_retry():
+    """Retry all failed/crashed companies from the last pipeline run."""
+    if _n8n_chain_running:
+        return {"status": "error", "message": "Pipeline is already running."}
+
+    failed = [
+        r for r in _n8n_pipeline_results
+        if r["status"] not in ("done", "pending")
+    ]
+    if not failed:
+        return {"status": "empty", "message": "No failed companies to retry."}
+
+    # Re-buffer failed companies using stored metadata so flush picks them up
+    async with _n8n_buffer_lock:
+        for r in failed:
+            company = r["company"]
+            meta = _company_metadata.get(company, {})
+            # Add a placeholder entry so the flush has something to process
+            if company not in _n8n_buffer_contacts:
+                _n8n_buffer_contacts[company] = []
+            r["status"] = "pending"
+            r["steps"] = {
+                "veri_r1": "pending",
+                "searcher": "pending",
+                "veri_r2": "pending",
+                "sheet_write": "pending",
+            }
+        await _n8n_buffer_reset_timer()
+
+    return {
+        "status": "retrying",
+        "companies": [r["company"] for r in failed],
+        "message": f"Re-queued {len(failed)} companies for retry.",
+    }
+
+
+@app.get("/api/config/check")
+async def config_check():
+    """Confirm which integrations are configured."""
+    from config import (
+        OPENAI_API_KEY, UNIPILE_API_KEY, APOLLO_API_KEY,
+        FIRECRAWL_API_KEY, ZEROBOUNCE_API_KEY, GOOGLE_SHEETS_CREDS_PATH,
     )
+    return {
+        "n8n": bool(N8N_WEBHOOK_URL),
+        "n8n_webhook_url": N8N_WEBHOOK_URL or "(not set)",
+        "openai": bool(OPENAI_API_KEY),
+        "unipile": bool(UNIPILE_API_KEY),
+        "apollo": bool(APOLLO_API_KEY),
+        "firecrawl": bool(FIRECRAWL_API_KEY),
+        "zerobounce": bool(ZEROBOUNCE_API_KEY),
+        "google_sheets": bool(GOOGLE_SHEETS_CREDS_PATH and OUTPUT_SHEET_ID),
+        "output_sheet_id": OUTPUT_SHEET_ID or "(not set)",
+    }
 
 
 @app.get("/api/n8n/companies")
@@ -1151,3 +1252,58 @@ async def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/n8n/test-send")
+async def n8n_test_send():
+    """
+    Sends a real test payload to the configured n8n webhook and returns
+    the raw HTTP response. Use this to confirm n8n is reachable and
+    receiving data correctly — without running the full pipeline.
+    """
+    if not N8N_WEBHOOK_URL:
+        return {
+            "ok": False,
+            "error": "N8N_WEBHOOK_URL is not set in .env",
+        }
+
+    test_payload = {
+        "sheetName": "Target Accounts",
+        "row": 0,
+        "Company_Name": "__TEST_COMPANY__",
+        "Parent_Company_Name": "",
+        "Sales_Navigator_Link": "",
+        "Company_Domain": "test.com",
+        "SDR_Name": "test",
+        "Email_Format(_Firstname-amy_,_Lastname-_williams)": "firstname.lastname",
+        "Account_type": "distributor",
+        "Account_Size": "",
+        "country": "India",
+        "_is_test": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                N8N_WEBHOOK_URL,
+                json=test_payload,
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text[:500]
+
+        return {
+            "ok": resp.status_code < 400,
+            "status_code": resp.status_code,
+            "n8n_webhook_url": N8N_WEBHOOK_URL,
+            "payload_sent": test_payload,
+            "n8n_response": body,
+        }
+    except httpx.ConnectError as e:
+        return {"ok": False, "error": f"Connection refused — is n8n running? {e}"}
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "Request timed out after 15s"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
