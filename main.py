@@ -39,7 +39,7 @@ from clients.sheets_client import (
     write_rows, contact_to_row, SHEET_HEADERS,
     write_target_account, write_verified_contacts,
     read_first_clean_list_for_company, count_pending_contacts,
-    write_contacts_to_first_clean_list,
+    write_contacts_to_first_clean_list, read_accepted_roles_for_company,
     TAB_ACCEPTED, TAB_UNDER_REVIEW, TAB_REJECTED,
 )
 from utils.dedup import deduplicate
@@ -48,14 +48,35 @@ from utils.dedup import deduplicate
 _stdout_utf8 = io.TextIOWrapper(
     sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
 )
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(_stdout_utf8),
-        logging.FileHandler("pipeline.log", encoding="utf-8"),
-    ],
-)
+
+# In-memory log buffer for the /logs UI page
+_LOG_BUFFER: list[dict] = []
+_LOG_BUFFER_MAX = 2000
+
+class _BufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        _LOG_BUFFER.append({
+            "ts":    time.strftime("%H:%M:%S", time.localtime(record.created)),
+            "level": record.levelname,
+            "name":  record.name,
+            "msg":   record.getMessage(),
+        })
+        if len(_LOG_BUFFER) > _LOG_BUFFER_MAX:
+            del _LOG_BUFFER[0]
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Force-attach to root logger so uvicorn can't pre-empt us
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+for _h in [
+    logging.StreamHandler(_stdout_utf8),
+    logging.FileHandler("pipeline.log", encoding="utf-8"),
+    _BufferHandler(),
+]:
+    _h.setFormatter(_fmt)
+    _root.addHandler(_h)
+
 logger = logging.getLogger(__name__)
 
 # ── Buffer / Chain State ──────────────────────────────────────────────────────
@@ -350,12 +371,18 @@ def _run_company_pipeline(
                     OUTPUT_SHEET_ID, verified_contacts, company_name, country, meta
                 )
         else:
-            logger.info("No contacts from n8n or sheet — will search all target roles")
+            logger.info("No contacts from n8n or sheet — checking Accepted sheet for already-covered roles")
             missing_all = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
+            already_covered: list[str] = []
+            if OUTPUT_SHEET_ID:
+                already_covered = read_accepted_roles_for_company(OUTPUT_SHEET_ID, company_name)
+                if already_covered:
+                    logger.info(f"Accepted sheet has {len(already_covered)} already-covered roles: {already_covered}")
+            still_missing = [r for r in missing_all if r not in already_covered]
             gap_report = {
-                "missing_roles": missing_all,
-                "covered_roles": [],
-                "coverage_percentage": 0,
+                "missing_roles": still_missing,
+                "covered_roles": already_covered,
+                "coverage_percentage": round(100 * len(already_covered) / len(missing_all)) if missing_all else 0,
                 "potential_leads_from_web": [],
             }
         _step("veri_r1", "done")
@@ -424,26 +451,17 @@ def _run_company_pipeline(
         logger.error(f"Veri R2 failed for {company_name}: {e}")
         _step("veri_r2", f"failed: {e}")
 
-    # ── Manual tasks go to Under Review sheet ────────────────────────────────
-    if manual_tasks and OUTPUT_SHEET_ID:
-        from clients.sheets_client import _append_rows, VERIFICATION_HEADERS, _ensure_headers, TAB_UNDER_REVIEW
-        manual_rows = []
+    # ── Manual tasks: log only — do NOT write to Under Review ────────────────
+    # Under Review is reserved for real people with empty LinkedIn profiles.
+    # Manual tasks (roles where nobody was found) are logged for the SDR to follow up.
+    if manual_tasks:
+        logger.info(f"Manual follow-up needed for {len(manual_tasks)} role(s):")
         for task in manual_tasks:
-            row = [""] * len(VERIFICATION_HEADERS)
-            row[0] = task["company"]
-            row[5] = task.get("country", country)
-            row[8] = task["role"]
-            row[9] = task["role"]
-            row[14] = "manual_needed"
-            row[19] = "needs_review"
-            row[20] = task["task"]
-            manual_rows.append(row)
-        _ensure_headers(OUTPUT_SHEET_ID, TAB_UNDER_REVIEW, VERIFICATION_HEADERS)
-        _append_rows(OUTPUT_SHEET_ID, TAB_UNDER_REVIEW, manual_rows)
+            logger.info(f"  ⚑ {task['role']} — {task['task']}")
 
     elapsed = time.time() - start
     total_accepted = sheet_counts_r1["accepted"] + sheet_counts_r2["accepted"]
-    total_review   = sheet_counts_r1["under_review"] + sheet_counts_r2["under_review"] + len(manual_tasks)
+    total_review   = sheet_counts_r1["under_review"] + sheet_counts_r2["under_review"]
     total_rejected = sheet_counts_r1["rejected"] + sheet_counts_r2["rejected"]
 
     logger.info(
@@ -478,10 +496,12 @@ async def _fire_pipeline_for_company(company_name: str, reason: str) -> None:
     if task and not task.done():
         task.cancel()
     logger.info(f"Firing pipeline for '{company_name}' — reason: {reason}")
+    # Only hold the lock briefly to register the company — never hold it during flush
     async with _n8n_buffer_lock:
         if company_name not in _n8n_buffer_contacts:
             _n8n_buffer_contacts[company_name] = []
-        await _n8n_buffer_flush()
+    # Flush outside the lock — pipeline can take 5-10 min and must not hold buffer_lock
+    await _n8n_buffer_flush()
 
 
 async def _poll_sheet_until_ready(company_name: str) -> None:
@@ -569,8 +589,10 @@ async def _n8n_buffer_reset_timer() -> None:
 
     async def _countdown() -> None:
         await asyncio.sleep(_N8N_BUFFER_TIMEOUT)
+        # Only hold the lock briefly to snapshot contacts — never during the full pipeline run
         async with _n8n_buffer_lock:
-            await _n8n_buffer_flush()
+            pass  # lock acquired just to ensure no concurrent writes are mid-flight
+        await _n8n_buffer_flush()
 
     _n8n_buffer_timer = asyncio.create_task(_countdown())
 
@@ -601,12 +623,22 @@ async def _n8n_buffer_flush() -> None:
         f"{sum(len(v) for v in buffered.values())} total contacts"
     )
 
+    if _n8n_chain_running:
+        logger.warning(
+            f"Buffer flush skipped — pipeline already running for '{_n8n_chain_current_company}'. "
+            f"Re-queuing: {company_list}"
+        )
+        # Put contacts back so they aren't lost
+        for co, entries in buffered.items():
+            _n8n_buffer_contacts.setdefault(co, []).extend(entries)
+        return
+
+    # Set state under lock (brief), then run pipeline OUTSIDE the lock
     async with _n8n_chain_lock:
         _n8n_chain_running = True
         _n8n_pipeline_results.clear()
         _n8n_pipeline_companies.clear()
         _n8n_pipeline_companies.extend(company_list)
-
         for co in company_list:
             _n8n_pipeline_results.append({
                 "company": co,
@@ -621,39 +653,39 @@ async def _n8n_buffer_flush() -> None:
                 "summary": {},
             })
 
-        try:
-            loop = asyncio.get_running_loop()
+    # Run pipeline OUTSIDE the lock — run_in_executor blocks for 5-10min and
+    # must not hold an asyncio.Lock (not safe to hold across thread boundaries)
+    logger.info(f"Starting pipeline for {company_list}")
+    try:
+        loop = asyncio.get_running_loop()
 
-            for i, company in enumerate(company_list):
-                entries = buffered[company]
-                # Extract just the normalized contact dicts
-                contacts = [norm for _raw, norm in entries]
-                # Use stored trigger metadata; fall back to inferring from contacts
-                meta = _company_metadata.get(company) or _infer_meta_from_contacts(contacts)
+        for i, company in enumerate(company_list):
+            entries = buffered[company]
+            contacts = [norm for _raw, norm in entries]
+            meta = _company_metadata.get(company) or _infer_meta_from_contacts(contacts)
 
-                _n8n_chain_current_company = company
-                company_result = _n8n_pipeline_results[i]
-                company_result["status"] = "running"
+            _n8n_chain_current_company = company
+            company_result = _n8n_pipeline_results[i]
+            company_result["status"] = "running"
 
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        _run_company_pipeline,
-                        company, contacts, meta, company_result,
-                    )
-                    company_result["status"] = "done"
-                except Exception as e:
-                    logger.error(f"Pipeline executor crashed for {company}: {e}")
-                    company_result["status"] = f"crashed: {e}"
+            try:
+                await loop.run_in_executor(
+                    None,
+                    _run_company_pipeline,
+                    company, contacts, meta, company_result,
+                )
+                company_result["status"] = "done"
+            except Exception as e:
+                logger.error(f"Pipeline executor crashed for {company}: {e}", exc_info=True)
+                company_result["status"] = f"crashed: {e}"
 
-                # Brief pause between companies to avoid hammering APIs
-                if i < len(company_list) - 1:
-                    await asyncio.sleep(5)
+            if i < len(company_list) - 1:
+                await asyncio.sleep(5)
 
-        finally:
-            _n8n_chain_running = False
-            _n8n_chain_current_company = ""
-            _n8n_chain_current_step = ""
+    finally:
+        _n8n_chain_running = False
+        _n8n_chain_current_company = ""
+        _n8n_chain_current_step = ""
 
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
@@ -663,7 +695,18 @@ async def lifespan(app: FastAPI):
     global _n8n_buffer_lock, _n8n_chain_lock
     _n8n_buffer_lock = asyncio.Lock()
     _n8n_chain_lock = asyncio.Lock()
-    logger.info("B2B Contact Mapping Pipeline started")
+
+    # Re-attach buffer handler AFTER uvicorn has done its logging setup
+    # (uvicorn calls dictConfig on startup which wipes root logger handlers)
+    _buf_handler = _BufferHandler()
+    _buf_handler.setFormatter(_fmt)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Avoid adding duplicate handlers on reload
+    if not any(isinstance(h, _BufferHandler) for h in root.handlers):
+        root.addHandler(_buf_handler)
+
+    logger.info("B2B Contact Mapping Pipeline started — logs available at /logs")
     yield
     logger.info("B2B Contact Mapping Pipeline shutting down")
 
@@ -723,7 +766,7 @@ input:focus,select:focus{outline:none;border-color:#6366f1}
 <body>
 <div class="wrap">
   <h1>SDR Contact Pipeline</h1>
-  <p class="sub">Enter a company — pipeline finds, verifies and writes all contacts to Google Sheets.</p>
+  <p class="sub">Enter a company — pipeline finds, verifies and writes all contacts to Google Sheets. &nbsp;<a href="/logs" target="_blank" style="color:#6366f1;font-size:12px">View Logs →</a></p>
 
   <div class="card">
     <h2>Company Details</h2>
@@ -813,78 +856,96 @@ function setAlert(msg,type='blue'){
 async function poll(){
   try{
     const d = await fetch('/api/n8n/pipeline').then(r=>r.json());
-    const res = (d.results||[]).find(r=>r.company===company)||(d.results||[])[0];
+    // Match by company name (case-insensitive fallback) or take first result
+    const res = (d.results||[]).find(r=>r.company.toLowerCase()===company.toLowerCase())
+             || (d.results||[])[0];
+    const pendingInfo = (d.n8n_pending||{})[company]
+                     || (d.n8n_pending||{})[Object.keys(d.n8n_pending||{})[0]];
+    const bufferHasOurs = (d.buffer?.companies||[]).some(c=>c.toLowerCase()===company.toLowerCase())
+                       || (d.phase==='buffering');
 
-    const bufferHasOurs = (d.buffer?.companies||[]).includes(company);
-    const pipelineHasOurs = (d.companies||[]).includes(company);
-    const pendingInfo = (d.n8n_pending||{})[company];
-
-    // n8n webhook call failed
-    if(d.phase==='n8n_failed' && pendingInfo && pendingInfo.n8n_ok===false){
-      clearInterval(pollId); pollId=null;
-      const err = pendingInfo.error||'unknown error';
-      const noUrl = !pendingInfo.n8n_url_configured;
-      const msg = noUrl
-        ? 'N8N_WEBHOOK_URL is not set in .env — n8n was not called. Use "Inject test contact" to test manually.'
-        : 'n8n webhook failed: '+err+'. Check that n8n is running and N8N_WEBHOOK_URL is correct.';
-      document.getElementById('compStep').textContent = noUrl ? 'n8n not configured' : 'n8n error';
-      document.getElementById('helpers').style.display='block';
-      setAlert(msg,'red');
-      document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').textContent='▶ Run Pipeline';
-
-    // Pipeline is actively running for our company
-    } else if(d.running && res && pipelineHasOurs){
-      waitingForN8n = false;
-      document.getElementById('compStep').textContent = 'Step: '+(d.current_step||'...');
-      document.getElementById('steps').innerHTML = renderSteps(res.steps||{});
-      document.getElementById('helpers').style.display='none';
-      setAlert('<span class="spin"></span>Pipeline running…');
+    // ── Terminal states — stop polling ──────────────────────────────────────
 
     // Done
-    } else if(res && res.status==='done' && pipelineHasOurs){
-      clearInterval(pollId); pollId=null;
+    if(res && res.status==='done'){
+      if(pollId){clearInterval(pollId); pollId=null;}
       document.getElementById('steps').innerHTML = renderSteps(res.steps||{});
       document.getElementById('compStep').textContent='Complete';
       document.getElementById('helpers').style.display='none';
-      setAlert('Done! Results written to Google Sheets.','green');
+      setAlert('&#10003; Done! Results written to Google Sheets.','green');
       showSummary(res.summary||{});
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='▶ Run Pipeline';
+      return;
+    }
 
-    // Failed/crashed
-    } else if(res && res.status && pipelineHasOurs &&
-              (res.status.startsWith('crashed')||res.status.startsWith('failed'))){
-      clearInterval(pollId); pollId=null;
+    // Crashed/failed
+    if(res && res.status && (res.status.startsWith('crashed')||res.status.startsWith('failed'))){
+      if(pollId){clearInterval(pollId); pollId=null;}
       setAlert('Pipeline error: '+res.status,'red');
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='▶ Run Pipeline';
+      return;
+    }
 
-    // Our company is buffered — timer ticking
-    } else if(bufferHasOurs){
+    // n8n call failed
+    if(d.phase==='n8n_failed'){
+      const err = pendingInfo?.error||'unknown error';
+      const noUrl = !pendingInfo?.n8n_url_configured;
+      if(pendingInfo?.n8n_ok===false || d.phase==='n8n_failed'){
+        if(pollId){clearInterval(pollId); pollId=null;}
+        const msg = noUrl
+          ? 'N8N_WEBHOOK_URL is not set in .env — n8n was not called. Use "Inject test contact" to test manually.'
+          : 'n8n webhook failed: '+err+'. Check that n8n is running and N8N_WEBHOOK_URL is correct.';
+        document.getElementById('compStep').textContent = noUrl ? 'n8n not configured' : 'n8n error';
+        document.getElementById('helpers').style.display='block';
+        setAlert(msg,'red');
+        document.getElementById('runBtn').disabled=false;
+        document.getElementById('runBtn').textContent='▶ Run Pipeline';
+        return;
+      }
+    }
+
+    // ── In-progress states ───────────────────────────────────────────────────
+
+    // Pipeline actively running
+    if(d.running){
       waitingForN8n = false;
-      const cnt = d.buffer.total_contacts;
-      document.getElementById('helpers').style.display='block';
-      document.getElementById('compStep').textContent='Contacts buffered — waiting for silence timer…';
-      setAlert('<span class="spin"></span>'+cnt+' contact'+(cnt!==1?'s':'')+' buffered. Pipeline fires in ~'+d.buffer.timeout_secs+'s of silence.');
+      document.getElementById('compStep').textContent='Step: '+(d.current_step||'...');
+      if(res) document.getElementById('steps').innerHTML=renderSteps(res.steps||{});
+      document.getElementById('helpers').style.display='none';
+      setAlert('<span class="spin"></span>Pipeline running… check <a href="/logs" target="_blank" style="color:#a5b4fc">Logs</a> for details');
+      return;
+    }
 
-    // n8n received trigger — polling sheet for contacts
-    } else if(d.phase==='waiting_n8n' && pendingInfo){
+    // Contacts buffered, timer counting
+    if(bufferHasOurs){
+      waitingForN8n = false;
+      const cnt = d.buffer?.total_contacts||0;
+      document.getElementById('helpers').style.display='block';
+      document.getElementById('compStep').textContent='Contacts buffered — waiting…';
+      setAlert('<span class="spin"></span>'+cnt+' contact'+(cnt!==1?'s':'')+' received. Pipeline fires soon.');
+      return;
+    }
+
+    // Waiting for n8n to write contacts to sheet
+    if(d.phase==='waiting_n8n' && pendingInfo){
       waitingForN8n = false;
       const pollIn = pendingInfo.next_poll_in_secs||0;
-      const secs = pendingInfo.waiting_secs||0;
+      const secs = Math.round(pendingInfo.waiting_secs||0);
       document.getElementById('helpers').style.display='block';
-      document.getElementById('compStep').textContent='n8n is writing contacts to sheet — checking every 30s…';
-      setAlert('<span class="spin"></span>Trigger sent to n8n ✓ — checking sheet for contacts (next check in '+pollIn+'s, waited '+secs+'s so far)');
+      document.getElementById('compStep').textContent='n8n writing contacts to sheet…';
+      setAlert('<span class="spin"></span>n8n is writing contacts — next sheet check in '+pollIn+'s (waited '+secs+'s)');
+      return;
+    }
 
-    // Still waiting for n8n submission to complete
-    } else if(waitingForN8n){
+    // Fallback: still waiting for initial n8n response
+    if(waitingForN8n){
       document.getElementById('helpers').style.display='block';
       document.getElementById('compStep').textContent='Sending to n8n…';
-      setAlert('<span class="spin"></span>Trigger sent. Waiting for n8n to respond…');
+      setAlert('<span class="spin"></span>Waiting for n8n to respond…');
     }
-    // If none of the above — silent, don't spam logs
-  }catch(e){console.error(e)}
+  }catch(e){console.error('poll error',e)}
 }
 
 function showSummary(s){
@@ -959,17 +1020,9 @@ document.getElementById('frm').addEventListener('submit',async e=>{
     return;
   }
 
-  // Poll every 5s while waiting for n8n — switches to 3s once pipeline starts
+  // Single 3s poll — handles all states, stops itself when done/failed
   if(pollId) clearInterval(pollId);
-  pollId=setInterval(async()=>{
-    await poll();
-    // Speed up polling once pipeline is actually running
-    const d = await fetch('/api/n8n/pipeline').then(r=>r.json()).catch(()=>({}));
-    if(d.running && pollId){
-      clearInterval(pollId);
-      pollId=setInterval(poll,3000);
-    }
-  },5000);
+  pollId=setInterval(poll,3000);
 });
 </script>
 </body>
@@ -980,6 +1033,219 @@ document.getElementById('frm').addEventListener('submit',async e=>{
 async def ui():
     """Simple web UI — open http://localhost:8000 in your browser."""
     return _UI_HTML
+
+
+# ── Logs UI ───────────────────────────────────────────────────────────────────
+
+_LOGS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pipeline Logs</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Menlo','Consolas','Courier New',monospace;background:#0f1117;color:#e2e8f0;font-size:12px;height:100vh;display:flex;flex-direction:column}
+#topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#1a1d27;border-bottom:1px solid #2d3148;flex-shrink:0;flex-wrap:wrap}
+#topbar h1{font-size:14px;font-weight:700;color:#a5b4fc;margin-right:6px;white-space:nowrap}
+.pill{padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;cursor:pointer;border:1.5px solid transparent;transition:all .15s}
+.pill.active{border-color:#6366f1;background:#1e1f3b;color:#a5b4fc}
+.pill.inactive{border-color:#2d3148;background:transparent;color:#6b7280}
+.pill:hover{border-color:#6366f1;color:#c7d2fe}
+#searchbox{padding:4px 10px;border-radius:7px;border:1.5px solid #2d3148;background:#0f1117;color:#e2e8f0;font-size:12px;font-family:inherit;width:200px}
+#searchbox:focus{outline:none;border-color:#6366f1}
+.spacer{flex:1}
+#counter{font-size:11px;color:#6b7280;white-space:nowrap}
+#clearbtn{padding:4px 12px;border-radius:7px;border:1.5px solid #ef4444;color:#ef4444;background:transparent;cursor:pointer;font-size:11px;font-family:inherit}
+#clearbtn:hover{background:#1f0a0a}
+#autoscroll{padding:4px 12px;border-radius:7px;border:1.5px solid #2d3148;color:#9ca3af;background:transparent;cursor:pointer;font-size:11px;font-family:inherit}
+#autoscroll.on{border-color:#10b981;color:#10b981}
+#logbox{flex:1;overflow-y:auto;padding:8px 14px}
+.row{display:flex;gap:8px;padding:2px 0;border-bottom:1px solid #1a1d27;line-height:1.55;align-items:baseline}
+.row:hover{background:#14172a}
+.ts{color:#4b5563;white-space:nowrap;flex-shrink:0;width:70px}
+.lvl{width:52px;flex-shrink:0;font-weight:700;text-align:center;border-radius:3px;padding:0 3px}
+.lvl.INFO{color:#60a5fa}
+.lvl.WARNING{color:#fbbf24}
+.lvl.ERROR{color:#f87171}
+.lvl.DEBUG{color:#a78bfa}
+.lvl.CRITICAL{color:#f43f5e;background:#1f0a0a}
+.name{color:#818cf8;flex-shrink:0;width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg{color:#d1d5db;word-break:break-all;flex:1}
+.msg .hi{background:#854d0e;color:#fef08a;border-radius:2px;padding:0 2px}
+/* phase colours */
+.ph-company_intel .name,.ph-company_intel .ts{color:#34d399}
+.ph-veri_r1 .name{color:#60a5fa}
+.ph-searcher .name{color:#f472b6}
+.ph-veri_r2 .name{color:#fb923c}
+#empty{color:#4b5563;text-align:center;margin-top:80px;font-size:13px}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>Pipeline Logs</h1>
+  <a href="/" style="color:#6b7280;font-size:11px;text-decoration:none">← back</a>
+  <span style="width:1px;height:16px;background:#2d3148"></span>
+  <!-- level filters -->
+  <span class="pill active" data-filter="level" data-val="ALL">ALL</span>
+  <span class="pill inactive" data-filter="level" data-val="INFO">INFO</span>
+  <span class="pill inactive" data-filter="level" data-val="WARNING">WARN</span>
+  <span class="pill inactive" data-filter="level" data-val="ERROR">ERROR</span>
+  <span style="width:1px;height:16px;background:#2d3148"></span>
+  <!-- phase filters -->
+  <span class="pill inactive" data-filter="phase" data-val="company_intel">Intel</span>
+  <span class="pill inactive" data-filter="phase" data-val="veri_r1">Veri R1</span>
+  <span class="pill inactive" data-filter="phase" data-val="searcher">Searcher</span>
+  <span class="pill inactive" data-filter="phase" data-val="veri_r2">Veri R2</span>
+  <span style="width:1px;height:16px;background:#2d3148"></span>
+  <input id="searchbox" type="text" placeholder="search…">
+  <div class="spacer"></div>
+  <span id="counter">0 entries</span>
+  <button id="autoscroll" class="on" onclick="toggleScroll()">Auto-scroll ON</button>
+  <button id="clearbtn" onclick="clearLogs()">Clear</button>
+</div>
+<div id="logbox"><div id="empty">Waiting for logs…</div></div>
+
+<script>
+let allLogs=[], filtered=[], after=0;
+let levelFilter='ALL', phaseFilter='', searchTerm='';
+let autoScroll=true;
+
+const PHASE_MAP={'company_intel':'ph-company_intel','verifier':'ph-veri_r1','searcher':'ph-searcher'};
+function phaseClass(name){
+  for(const [k,v] of Object.entries(PHASE_MAP)) if(name.includes(k)) return v;
+  return '';
+}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/\x3c/g,'&lt;').replace(/\x3e/g,'&gt;')}
+
+function highlight(msg, term){
+  if(!term) return esc(msg);
+  const escaped = esc(msg);
+  const tl = term.toLowerCase();
+  const ml = escaped.toLowerCase();
+  let out = '', i = 0;
+  while(i < escaped.length){
+    const j = ml.indexOf(tl, i);
+    if(j === -1){ out += escaped.slice(i); break; }
+    out += escaped.slice(i,j) + '<span class="hi">' + escaped.slice(j, j+tl.length) + '</span>';
+    i = j + tl.length;
+  }
+  return out;
+}
+
+function matchesFilters(e){
+  if(levelFilter!=='ALL' && e.level!==levelFilter) return false;
+  if(phaseFilter && !e.name.toLowerCase().includes(phaseFilter)) return false;
+  if(searchTerm && !e.msg.toLowerCase().includes(searchTerm) && !e.name.toLowerCase().includes(searchTerm)) return false;
+  return true;
+}
+
+function renderAll(){
+  filtered=allLogs.filter(matchesFilters);
+  const box=document.getElementById('logbox');
+  if(!filtered.length){box.innerHTML='<div id="empty">No matching logs.</div>';return;}
+  box.innerHTML=filtered.map(e=>`
+    <div class="row ${phaseClass(e.name)}">
+      <span class="ts">${esc(e.ts)}</span>
+      <span class="lvl ${e.level}">${esc(e.level)}</span>
+      <span class="name" title="${esc(e.name)}">${esc(e.name.split('.').pop())}</span>
+      <span class="msg">${highlight(e.msg,searchTerm)}</span>
+    </div>`).join('');
+  document.getElementById('counter').textContent=filtered.length+' / '+allLogs.length+' entries';
+  if(autoScroll) box.scrollTop=box.scrollHeight;
+}
+
+function appendRows(newEntries){
+  const matching=newEntries.filter(matchesFilters);
+  if(!matching.length){
+    document.getElementById('counter').textContent=filtered.length+' / '+allLogs.length+' entries';
+    return;
+  }
+  const box=document.getElementById('logbox');
+  const empty=document.getElementById('empty');
+  if(empty) empty.remove();
+  matching.forEach(e=>{
+    filtered.push(e);
+    const d=document.createElement('div');
+    d.className='row '+phaseClass(e.name);
+    d.innerHTML=`<span class="ts">${esc(e.ts)}</span><span class="lvl ${e.level}">${esc(e.level)}</span><span class="name" title="${esc(e.name)}">${esc(e.name.split('.').pop())}</span><span class="msg">${highlight(e.msg,searchTerm)}</span>`;
+    box.appendChild(d);
+  });
+  document.getElementById('counter').textContent=filtered.length+' / '+allLogs.length+' entries';
+  if(autoScroll) box.scrollTop=box.scrollHeight;
+}
+
+async function poll(){
+  const resp=await fetch('/api/logs?after='+after).catch(()=>null);
+  if(!resp||!resp.ok) return;
+  const data=await resp.json();
+  if(data.entries&&data.entries.length){
+    allLogs.push(...data.entries);
+    after=data.next_after;
+    appendRows(data.entries);
+  }
+}
+
+function applyFilter(el){
+  const {filter,val}=el.dataset;
+  if(filter==='level'){
+    levelFilter=val;
+    document.querySelectorAll('[data-filter=level]').forEach(p=>{p.className='pill '+(p.dataset.val===val?'active':'inactive')});
+  } else {
+    phaseFilter=(phaseFilter===val?'':val);
+    document.querySelectorAll('[data-filter=phase]').forEach(p=>{p.className='pill '+(p.dataset.val===phaseFilter?'active':'inactive')});
+  }
+  renderAll();
+}
+
+function toggleScroll(){
+  autoScroll=!autoScroll;
+  const btn=document.getElementById('autoscroll');
+  btn.textContent='Auto-scroll '+(autoScroll?'ON':'OFF');
+  btn.className=autoScroll?'on':'';
+}
+
+function clearLogs(){
+  allLogs=[];filtered=[];after=0;
+  fetch('/api/logs/clear',{method:'POST'});
+  document.getElementById('logbox').innerHTML='<div id="empty">Cleared.</div>';
+  document.getElementById('counter').textContent='0 entries';
+}
+
+document.querySelectorAll('.pill').forEach(p=>p.addEventListener('click',()=>applyFilter(p)));
+document.getElementById('searchbox').addEventListener('input',e=>{searchTerm=e.target.value.toLowerCase();renderAll();});
+document.getElementById('logbox').addEventListener('scroll',function(){
+  if(this.scrollTop+this.clientHeight<this.scrollHeight-50&&autoScroll){
+    autoScroll=false;
+    const btn=document.getElementById('autoscroll');
+    btn.textContent='Auto-scroll OFF';btn.className='';
+  }
+});
+
+setInterval(poll,1500);
+poll();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/logs", response_class=HTMLResponse)
+async def logs_ui():
+    return _LOGS_HTML
+
+
+@app.get("/api/logs")
+async def api_logs(after: int = 0):
+    """Return log entries after the given index. Used by the /logs page."""
+    entries = _LOG_BUFFER[after:]
+    return {"entries": entries, "next_after": after + len(entries)}
+
+
+@app.post("/api/logs/clear")
+async def api_logs_clear():
+    _LOG_BUFFER.clear()
+    return {"cleared": True}
 
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────

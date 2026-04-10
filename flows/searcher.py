@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 from clients.openai_client import call_gpt5, call_gpt_fast
 from clients.unipile_client import (
@@ -302,6 +303,24 @@ def _lookup_linkedin(first: str, last: str, company_name: str) -> str:
         return ""
 
 
+def _is_likely_hallucinated_linkedin(url: str) -> bool:
+    """
+    Return True if the LinkedIn URL looks GPT-fabricated.
+    Hallucinations often append a long numeric suffix: /in/name-123456789
+    Real slugs are alphanumeric, may have short numeric parts (≤ 6 chars).
+    """
+    if not url:
+        return False
+    slug = url.rstrip("/").split("/in/")[-1] if "/in/" in url else ""
+    if not slug:
+        return True  # Not a /in/ URL at all
+    # If the last hyphen-segment is a long pure-digit string (7+ digits), it's fake
+    parts = slug.split("-")
+    if parts and re.fullmatch(r"\d{7,}", parts[-1]):
+        return True
+    return False
+
+
 def _build_contact_from_match(
     match: dict,
     current_role: str,
@@ -316,8 +335,23 @@ def _build_contact_from_match(
     # Get extra fields from raw Apollo/Clay result if available
     raw = match.get("_raw", {})
 
-    # LinkedIn URL: use what the layer found, fall back to Unipile name search
+    # LinkedIn URL: use what the layer found, validate it, fall back to Unipile name search
     linkedin_url = match.get("linkedin_url") or raw.get("linkedin_url", "")
+
+    # Reject hallucinated URLs (e.g. ankur-arora-123456789 from GPT deep search)
+    if linkedin_url and _is_likely_hallucinated_linkedin(linkedin_url):
+        logger.warning(f"  [LinkedIn] ⚠ Likely hallucinated URL discarded: {linkedin_url}")
+        linkedin_url = ""
+
+    # If GPT-sourced URL passes heuristic, verify it actually resolves via Unipile
+    if linkedin_url and match.get("source") == "gpt5_web":
+        username = extract_username(linkedin_url)
+        if username:
+            probe = fetch_linkedin_profile(username)
+            if probe.get("_not_found"):
+                logger.warning(f"  [LinkedIn] ⚠ GPT URL {linkedin_url} not found on Unipile — discarding")
+                linkedin_url = ""
+
     if not linkedin_url and first and last and company_name:
         linkedin_url = _lookup_linkedin(first, last, company_name)
         if linkedin_url:
@@ -430,50 +464,70 @@ def search_gaps(
         }
 
     # Step 1: Role expansion
-    logger.info(f"Expanding {len(remaining_roles)} roles for waterfall search")
+    logger.info(f"━━━ SEARCHER START: {company_name} | {len(remaining_roles)} missing roles ━━━")
+    logger.info(f"   [GPT-mini] Expanding roles → search terms")
     role_clusters = _expand_roles(remaining_roles, country)
 
     # Step 2: Waterfall for each role
-    for role in remaining_roles:
+    for ridx, role in enumerate(remaining_roles, 1):
         search_terms = role_clusters.get(role, [role])
-        logger.info(f"Waterfall search for role: {role} | terms: {search_terms[:3]}")
+        logger.info(f"── [{ridx}/{len(remaining_roles)}] Role: '{role}' | terms: {search_terms[:4]}")
         match = None
 
         # Layer 1: Unipile
-        if linkedin_numeric_id:
+        if linkedin_numeric_id or sales_nav_url:
+            logger.info(f"   [L1 Unipile] Searching Sales Nav / classic LinkedIn")
             match = _layer1_unipile(sales_nav_url, linkedin_numeric_id, search_terms, role, company_name, country)
             if match:
-                logger.info(f"Layer 1 (Unipile) found match for {role}")
+                logger.info(f"   [L1 Unipile] ✓ Found: {match.get('first_name')} {match.get('last_name')} title='{match.get('title')}' confidence={match.get('confidence')}")
+            else:
+                logger.info(f"   [L1 Unipile] ✗ No match")
+        else:
+            logger.info(f"   [L1 Unipile] Skipped — no linkedin_numeric_id or sales_nav_url")
 
         # Layer 2: Apollo
         if not match and domain:
+            logger.info(f"   [L2 Apollo] Searching domain={domain}")
             match = _layer2_apollo(domain, search_terms, role, company_name, country)
             if match:
-                logger.info(f"Layer 2 (Apollo) found match for {role}")
+                logger.info(f"   [L2 Apollo] ✓ Found: {match.get('first_name')} {match.get('last_name')} title='{match.get('title')}'")
+            else:
+                logger.info(f"   [L2 Apollo] ✗ No match")
+        elif not match:
+            logger.info(f"   [L2 Apollo] Skipped — no domain")
 
         # Layer 3: Clay
         if not match:
+            logger.info(f"   [L3 Clay] Searching")
             match = _layer3_clay(domain, search_terms, role, company_name, country)
             if match:
-                logger.info(f"Layer 3 (Clay) found match for {role}")
+                logger.info(f"   [L3 Clay] ✓ Found: {match.get('first_name')} {match.get('last_name')}")
+            else:
+                logger.info(f"   [L3 Clay] ✗ No match")
 
         # Layer 4: Firecrawl + GPT web search
         if not match:
+            logger.info(f"   [L4 GPT-4o+web] Firecrawl web search")
             match = _layer4_firecrawl_gpt(
                 domain, search_terms, role, company_name, country, account_type, already_scraped_urls
             )
             if match:
-                logger.info(f"Layer 4 (Firecrawl+GPT) found match for {role}")
+                logger.info(f"   [L4 GPT-4o+web] ✓ Found: {match.get('first_name')} {match.get('last_name')} source='{match.get('source')}' confidence={match.get('confidence')}")
+            else:
+                logger.info(f"   [L4 GPT-4o+web] ✗ No match")
 
         # Layer 5: Deep GPT web search
         if not match:
+            logger.info(f"   [L5 GPT-4o+web] Deep search")
             match = _layer5_deep_search(role, company_name, country, account_type, search_terms)
             if match:
-                logger.info(f"Layer 5 (Deep GPT) found match for {role}")
+                logger.info(f"   [L5 GPT-4o+web] ✓ Found: {match.get('first_name')} {match.get('last_name')} source='{match.get('source')}' adjacent={match.get('is_adjacent_role')}")
+            else:
+                logger.info(f"   [L5 GPT-4o+web] ✗ No match — flagging manual")
 
         # Layer 6: Manual flag
         if not match:
-            logger.info(f"Layer 6: Manual flag for {role} at {company_name}")
+            logger.info(f"   [L6 Manual] ⚑ Flagged for manual follow-up: '{role}'")
             manual_tasks.append({
                 "role": role,
                 "company": company_name,
@@ -491,9 +545,11 @@ def search_gaps(
 
         # Build contact from match
         contact = _build_contact_from_match(match, role, company_context, email_format)
+        logger.info(f"   → Contact built: {contact.get('first_name')} {contact.get('last_name')} email='{contact.get('email')}' li='{contact.get('linkedin_url')}'")
         new_contacts.append(contact)
 
     deduped = deduplicate(new_contacts, existing_contacts)
+    logger.info(f"━━━ SEARCHER DONE: found={len(deduped)} manual={len(manual_tasks)} ━━━")
 
     return {
         "new_contacts": deduped,

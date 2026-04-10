@@ -1,7 +1,7 @@
 import json
 import logging
 from clients.firecrawl_client import scrape_url
-from clients.openai_client import call_gpt5
+from clients.openai_client import call_gpt5, call_gpt_fast
 from utils.json_parser import parse_gpt_json
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ Extract EVERY person mentioned with their title/role at this company. Include:
 Return ONLY this JSON:
 {{"people": [{{"name": "Full Name", "title": "Their Title/Role", "source": "which URL or source"}}]}}"""
 
-    raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
+    raw = call_gpt_fast(prompt, use_web_search=False, temperature=0.1)
     result = parse_gpt_json(raw)
     if not result:
         logger.warning("GPT people extraction returned unparseable response")
@@ -158,18 +158,23 @@ def scrape_company_intel(
     external_content = _firecrawl_external_pages(pages_found)
     scraped_content.update(external_content)
 
-    # Step 4: Extract all people from all scraped content
+    # Step 4: Extract all people from scraped content
     combined_text = "\n\n".join(
         f"=== {source} ===\n{content}"
         for source, content in scraped_content.items()
     )
 
-    people_found = _extract_people(company_name, country, combined_text[:15000])
-    # Merge with directly mentioned people (dedup by name)
-    existing_names = {p["name"].lower() for p in people_found}
-    for p in people_mentioned_directly:
-        if p.get("name", "").lower() not in existing_names:
-            people_found.append(p)
+    # Skip _extract_people LLM call if web search already returned enough direct mentions
+    if len(people_mentioned_directly) >= 5:
+        logger.info(f"Skipping _extract_people — web search already returned {len(people_mentioned_directly)} people")
+        people_found = list(people_mentioned_directly)
+    else:
+        people_found = _extract_people(company_name, country, combined_text[:15000])
+        # Merge with directly mentioned people (dedup by name)
+        existing_names = {p["name"].lower() for p in people_found}
+        for p in people_mentioned_directly:
+            if p.get("name", "").lower() not in existing_names:
+                people_found.append(p)
 
     result = {
         "scraped_content": scraped_content,

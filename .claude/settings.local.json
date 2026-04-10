@@ -24,7 +24,10 @@
       "Bash(python -m uvicorn main:app --port 8000)",
       "Bash(python -c \"import urllib.request; print\\(urllib.request.urlopen\\('http://localhost:8000/health'\\).read\\(\\).decode\\(\\)\\)\")",
       "Bash(python test_under_review.py)",
-      "Bash(python -c \"from clients.openai_client import call_gpt5; print\\(call_gpt5\\('hi :\\)'\\)\\)\")"
+      "Bash(python -c \"from clients.openai_client import call_gpt5; print\\(call_gpt5\\('hi :\\)'\\)\\)\")",
+      "Bash(python -c \"import flows.verifier; print\\('OK'\\)\")",
+      "Bash(python -c \"import flows.verifier; import flows.searcher; print\\('imports OK'\\)\")",
+      "Bash(python -c \"import flows.verifier; import main; print\\('imports OK'\\)\")"
     ]
   }
 }

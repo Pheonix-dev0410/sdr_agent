@@ -336,6 +336,29 @@ def write_contacts_to_first_clean_list(
     return ok
 
 
+def read_accepted_roles_for_company(sheet_id: str, company_name: str) -> list[str]:
+    """
+    Read the Accepted sheet and return matched_role values already accepted for
+    this company. Used to prevent re-searching roles already covered in a prior run.
+    """
+    try:
+        rows = read_sheet(sheet_id, f"'{TAB_ACCEPTED}'!A:J")
+        if not rows or len(rows) < 2:
+            return []
+        covered = []
+        for row in rows[1:]:
+            while len(row) < 10:
+                row.append("")
+            row_company = row[0].lower()
+            buying_role = row[9]  # col J = Buying Role = matched_role
+            if company_name.lower() in row_company and buying_role:
+                covered.append(buying_role)
+        return covered
+    except Exception as e:
+        logger.warning(f"Could not read accepted roles for {company_name}: {e}")
+        return []
+
+
 # ── Verification sheets ───────────────────────────────────────────────────────
 
 def _contact_to_verification_row(

@@ -2,7 +2,7 @@ import json
 import logging
 from pathlib import Path
 
-from clients.openai_client import call_gpt5
+from clients.openai_client import call_gpt5, call_gpt_fast
 from clients.unipile_client import fetch_linkedin_profile, extract_username, extract_profile_fields
 from clients.zerobounce_client import verify_email as zb_verify_email, is_valid as zb_is_valid
 from utils.json_parser import parse_gpt_json
@@ -152,12 +152,12 @@ Return ONLY this JSON:
 def _web_verify_contact(contact: dict, company_name: str, country: str) -> dict:
     prompt = f"""Does {contact.get('first_name', '')} {contact.get('last_name', '')} currently work at {company_name} in {country}? What is their current role?
 
-Search everywhere: LinkedIn, Facebook, press releases, news, industry events, business directories, government filings, social media, Google Maps, job boards, any source in any language.
+Search LinkedIn, Facebook, press releases, news, business directories, in any language.
 
 Return ONLY this JSON:
 {{"still_at_company": true, "current_title": "title or unknown", "source": "where you found this", "confidence": 0.85}}"""
 
-    raw = call_gpt5(prompt, use_web_search=True, temperature=0.1)
+    raw = call_gpt_fast(prompt, use_web_search=True, temperature=0.1)
     result = parse_gpt_json(raw)
     if not result:
         return {"still_at_company": None, "current_title": "unknown", "source": "none", "confidence": 0.0}
@@ -171,35 +171,50 @@ def _generate_gap_report(
     account_type: str,
     company_intel: dict,
 ) -> dict:
+    """
+    Programmatic gap report — no LLM call needed.
+    Compares matched_role of valid contacts against the target roles list.
+    People found via company intel are surfaced as potential leads for uncovered roles.
+    """
     target_roles = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
-    roles_list = "\n".join(f"- {r}" for r in target_roles)
 
-    contact_list = [
-        {"name": f"{c.get('first_name', '')} {c.get('last_name', '')}", "role": c.get("matched_role", c.get("job_title", ""))}
+    covered_roles = list({
+        c["matched_role"]
         for c in verified_contacts
-        if c.get("verification_status") == "valid"
-    ]
+        if c.get("verification_status") == "valid" and c.get("matched_role")
+    })
 
-    prompt = f"""Given these VERIFIED contacts at {company_name} ({country}):
-{json.dumps(contact_list)}
+    # A target role is "covered" if any verified valid contact matched it
+    missing_roles = [r for r in target_roles if r not in covered_roles]
 
-And the TARGET ROLE LIST for a {account_type}:
-{roles_list}
+    coverage_pct = round(100 * len(covered_roles) / len(target_roles)) if target_roles else 0
 
-Also, the following people were found on external web sources during company research but were NOT in the n8n contact list:
-{json.dumps(company_intel.get('people_found', []))}
+    # Surface company-intel people as potential leads for missing roles
+    potential_leads = []
+    for person in company_intel.get("people_found", []):
+        title = person.get("title", "").lower()
+        for role in missing_roles:
+            # Simple keyword overlap between intel person's title and missing role
+            role_words = set(role.lower().split())
+            if any(w in title for w in role_words if len(w) > 3):
+                potential_leads.append({
+                    "name": person.get("name", ""),
+                    "title": person.get("title", ""),
+                    "source": person.get("source", "company_intel"),
+                    "likely_role": role,
+                })
+                break  # one role per person
 
-Which target roles are NOT covered? Consider both the verified contacts AND the people found from web sources. If a person from web sources fills a gap, note them as a potential lead.
-
-Return ONLY this JSON:
-{{"missing_roles": ["role1"], "covered_roles": ["role2"], "coverage_percentage": 75, "potential_leads_from_web": [{{"name": "...", "title": "...", "source": "...", "likely_role": "..."}}]}}"""
-
-    raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
-    result = parse_gpt_json(raw)
-    if not result:
-        logger.warning("Gap report GPT parse failed")
-        return {"missing_roles": [], "covered_roles": [], "coverage_percentage": 0, "potential_leads_from_web": []}
-    return result
+    logger.info(
+        f"Gap report: covered={len(covered_roles)} missing={len(missing_roles)} "
+        f"coverage={coverage_pct}% leads_from_intel={len(potential_leads)}"
+    )
+    return {
+        "missing_roles": missing_roles,
+        "covered_roles": covered_roles,
+        "coverage_percentage": coverage_pct,
+        "potential_leads_from_web": potential_leads,
+    }
 
 
 def verify_contacts(
@@ -215,9 +230,13 @@ def verify_contacts(
     valid_count = 0
     invalid_count = 0
     needs_review_count = 0
+    assigned_emails: set[str] = set()  # track emails already assigned in this batch
 
-    for contact in contacts:
-        logger.info(f"Verifying {contact.get('first_name')} {contact.get('last_name')} at {company_name}")
+    logger.info(f"━━━ VERIFIER START: {company_name} | {len(contacts)} contacts ━━━")
+
+    for idx, contact in enumerate(contacts, 1):
+        name = f"{contact.get('first_name','')} {contact.get('last_name','')}".strip()
+        logger.info(f"── [{idx}/{len(contacts)}] {name} | title='{contact.get('job_title','')}' | email='{contact.get('email','')}' | li='{contact.get('linkedin_url','')}'")
         result = dict(contact)  # copy
 
         # Step 1: Unipile profile fetch
@@ -227,88 +246,253 @@ def verify_contacts(
         unipile_status = "not_found"
 
         if username:
+            logger.info(f"   [Unipile] Fetching LinkedIn profile for '{username}'")
             raw_profile = fetch_linkedin_profile(username)
             if not raw_profile.get("_not_found"):
                 unipile_profile = extract_profile_fields(raw_profile)
                 unipile_status = "found"
-                logger.info(f"Unipile profile found for {username}")
+                logger.info(f"   [Unipile] ✓ Profile found — current_title='{unipile_profile.get('current_title','')}' company='{unipile_profile.get('current_company','')}'")
             else:
-                logger.info(f"Unipile profile not found for {username}")
+                logger.info(f"   [Unipile] ✗ Profile not found for '{username}'")
+        else:
+            logger.info(f"   [Unipile] Skipped — no LinkedIn URL")
+
+        # Detect empty profile: Unipile returned a response but no title/company data
+        unipile_empty = (
+            unipile_status == "found"
+            and not unipile_profile.get("current_title")
+            and not unipile_profile.get("current_company")
+        )
+        if unipile_empty:
+            logger.info(f"   [Unipile] ⚠ Profile returned but empty (no title/company) — will trigger web verify")
 
         result["unipile_status"] = unipile_status
 
         # Step 2: GPT verification using Unipile data + company intel
+        logger.info(f"   [GPT-4o] Verifying contact (unipile_status={unipile_status}, empty={unipile_empty})")
         gpt_result = _verify_contact_with_gpt(
             contact, company_name, country, account_type, unipile_profile, company_intel
+        )
+        logger.info(
+            f"   [GPT-4o] → status={gpt_result.get('status')} "
+            f"matched_role='{gpt_result.get('matched_role')}' "
+            f"tier={gpt_result.get('role_tier')} "
+            f"confidence={gpt_result.get('confidence')} "
+            f"company_confirmed={gpt_result.get('current_company_confirmed')} "
+            f"reason='{gpt_result.get('reason','')}'"
         )
 
         status = gpt_result.get("status", "needs_review")
         confidence = gpt_result.get("confidence", 0.0)
+
+        # ── Fallback role match ────────────────────────────────────────────────
+        # GPT sometimes returns matched_role=None for valid compound/abbreviated titles
+        # (e.g. "Co-Founder & Technology Head" → should match "Head of IT / IT Director / CIO / GM IT").
+        # If company is confirmed but GPT gave no match, try Python keyword matching as a rescue.
+        if not gpt_result.get("matched_role") and gpt_result.get("current_company_confirmed"):
+            target_roles_list = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
+            # Use the LinkedIn title if available (more reliable than input title), else input title
+            title_for_match = (
+                unipile_profile.get("current_title") or contact.get("job_title", "")
+            ).lower()
+            # Strip compound noise: take the part after "& " or "and " for co-founder combos
+            for sep in [" & ", " and ", ", "]:
+                if sep in title_for_match:
+                    parts = [p.strip() for p in title_for_match.split(sep)]
+                    # Prefer the non-founder part
+                    non_founder = [p for p in parts if "founder" not in p and "partner" not in p]
+                    if non_founder:
+                        title_for_match = non_founder[-1]  # last non-founder segment
+            for target_role in target_roles_list:
+                role_keywords = [w for w in target_role.lower().replace("/", " ").split() if len(w) > 3]
+                matches = sum(1 for kw in role_keywords if kw in title_for_match)
+                if matches >= 2 or (len(role_keywords) == 1 and role_keywords[0] in title_for_match):
+                    gpt_result["matched_role"] = target_role
+                    logger.info(
+                        f"   [Role fallback] ✓ Keyword match rescued: '{title_for_match}' → '{target_role}'"
+                    )
+                    break
+
         company_intel_resolved = any(
             contact.get("first_name", "").lower() in p.get("name", "").lower()
             and contact.get("last_name", "").lower() in p.get("name", "").lower()
             for p in company_intel.get("people_found", [])
         )
 
-        # Step 3: Conditional deep web verification
+        # Don't trust intel if the job title itself mentions a DIFFERENT company
+        # e.g. "President FMCG, RP Sanjiv Goenka Group" or "Head of AI, Accenture"
+        job_title_lower = contact.get("job_title", "").lower()
+        title_names_other_company = (
+            company_intel_resolved
+            and company_name.lower() not in job_title_lower
+            and any(c in job_title_lower for c in [",", " at ", " @ ", "- "])
+        )
+        if title_names_other_company:
+            company_intel_resolved = False
+            logger.info(f"   [Intel] ⚠ Title appears to name a different company — not trusting intel, will web verify")
+        elif company_intel_resolved:
+            logger.info(f"   [Intel] ✓ Person found in company intel — skipping web verify")
+
+        # Step 3: Web verify
+        # Fires when:
+        #   - Unipile found nothing at all (not_found)
+        #   - Unipile returned an empty profile (found but blank) ← new
+        #   - GPT confidence is low
+        # Does NOT fire if already hard-rejected by role (waste of quota)
         needs_web_check = (
-            (unipile_status == "not_found" or confidence < 0.5 or status == "needs_review")
+            (unipile_status == "not_found" or unipile_empty or confidence < 0.35)
             and not company_intel_resolved
+            and status != "invalid"
         )
 
         if needs_web_check:
-            logger.info(f"Running web verification for {contact.get('first_name')} {contact.get('last_name')}")
+            reason_parts = []
+            if unipile_status == "not_found": reason_parts.append("unipile=not_found")
+            if unipile_empty: reason_parts.append("unipile=empty_profile")
+            if confidence < 0.35: reason_parts.append(f"confidence={confidence:.2f}")
+            logger.info(f"   [GPT-mini+web] Running web verification ({', '.join(reason_parts)})")
             web_result = _web_verify_contact(contact, company_name, country)
             web_confidence = web_result.get("confidence", 0.0)
+            logger.info(
+                f"   [GPT-mini+web] → still_at_company={web_result.get('still_at_company')} "
+                f"confidence={web_confidence:.2f} source='{web_result.get('source','')}'"
+            )
 
             if web_result.get("still_at_company") is True and web_confidence > 0.6:
+                # Web confirmed — promote back to valid regardless of empty Unipile
                 status = "valid"
                 confidence = max(confidence, web_confidence)
+                logger.info(f"   [GPT-mini+web] ✓ Web confirmed employment — promoted to valid")
             elif web_result.get("still_at_company") is False and web_confidence > 0.7:
                 status = "invalid"
                 confidence = max(confidence, web_confidence)
+                logger.info(f"   [GPT-mini+web] ✗ Web confirmed NOT at company — invalid")
+            else:
+                # Web inconclusive + empty Unipile → needs_review for manual check
+                if unipile_empty and status != "invalid":
+                    status = "needs_review"
+                    logger.info(f"   [GPT-mini+web] ~ Inconclusive + empty LinkedIn → needs_review (manual check)")
 
             gpt_result["web_verification"] = web_result
+        else:
+            logger.info(f"   [Web verify] Skipped (unipile={unipile_status}, empty={unipile_empty}, confidence={confidence:.2f}, intel={company_intel_resolved}, status={status})")
 
         role_tier = gpt_result.get("role_tier", "none")
+        matched_role = gpt_result.get("matched_role")
+
+        # If GPT gave a matched_role but tier=none, that's a contradiction —
+        # infer the tier by checking which tier bucket the matched_role falls in.
+        if matched_role and role_tier == "none":
+            for tier_name, tier_roles in ROLE_TIERS.items():
+                if any(matched_role.lower() in r.lower() or r.lower() in matched_role.lower() for r in tier_roles):
+                    role_tier = tier_name
+                    gpt_result["role_tier"] = role_tier
+                    logger.info(f"   [Tier fix] Inferred tier={role_tier} for matched_role='{matched_role}'")
+                    break
 
         # Hard rule: if role does not match ANY target role tier → Rejected immediately.
-        # No exceptions — junior/lower-level roles are never Accepted or Under Review.
-        if role_tier == "none" or not gpt_result.get("matched_role"):
+        if role_tier == "none" or not matched_role:
             status = "invalid"
             issues = gpt_result.get("issues", [])
             if "no_role_match" not in issues:
                 issues = issues + ["no_role_match"]
             gpt_result["issues"] = issues
             logger.info(
-                f"  Rejected (no role match): "
-                f"{contact.get('first_name')} {contact.get('last_name')} | "
-                f"title='{contact.get('job_title')}'"
+                f"   [REJECTED] No role match — title='{contact.get('job_title')}' "
+                f"issues={gpt_result['issues']}"
             )
 
-        # Step 4: ZeroBounce email verification (only if contact has an email)
+        # Step 4: ZeroBounce email verification
+        # C-suite tiers (final/key decision makers) are NEVER downgraded by email alone —
+        # their email is tried plus all permutations before giving up, and even then
+        # they stay valid with a note.
         email = contact.get("email", "")
         email_status = "no_email"
-        if email and "@" in email:
-            try:
-                zb_result = zb_verify_email(email)
-                if zb_is_valid(zb_result):
-                    email_status = "valid"
+        C_SUITE_TIERS = {"final_decision_maker", "key_decision_maker"}
+        is_c_suite = role_tier in C_SUITE_TIERS
+
+        # Skip ZeroBounce entirely for non-c-suite contacts already rejected —
+        # no point spending API quota on someone we're rejecting anyway
+        if status == "invalid" and not is_c_suite:
+            logger.info(f"   [ZeroBounce] Skipped — contact is already invalid (non-c-suite)")
+
+        elif email and "@" in email:
+            domain_part = email.split("@")[1] if "@" in email else ""
+            first = contact.get("first_name", "")
+            last = contact.get("last_name", "")
+
+            def _try_zb(addr: str) -> tuple[bool, str]:
+                """Returns (is_valid, status_str)."""
+                try:
+                    r = zb_verify_email(addr)
+                    if zb_is_valid(r):
+                        return True, "valid"
+                    return False, r.get("status", "unknown").lower()
+                except Exception as e:
+                    logger.warning(f"   [ZeroBounce] ERROR for {addr}: {e}")
+                    return False, "unverified"
+
+            logger.info(f"   [ZeroBounce] Checking email: {email}")
+            ok, zb_stat = _try_zb(email)
+
+            if ok:
+                if email in assigned_emails:
+                    # Another contact in this batch already owns this email
+                    logger.warning(f"   [ZeroBounce] ⚠ {email} already assigned to another contact — treating as invalid")
+                    ok = False
+                    zb_stat = "collision"
                 else:
-                    zb_stat = zb_result.get("status", "unknown").lower()
-                    email_status = zb_stat  # e.g. "invalid", "catch-all", "unknown", "spamtrap"
-                    # Downgrade to needs_review if valid contact but bad email
+                    email_status = "valid"
+                    assigned_emails.add(email)
+                    logger.info(f"   [ZeroBounce] ✓ {email} → valid")
+
+            if not ok:
+                logger.info(f"   [ZeroBounce] ~ {email} → {zb_stat} — trying permutations")
+
+                # Build all permutations using email_patterns
+                from utils.email_patterns import construct_email, FALLBACK_FORMATS
+                all_formats = [
+                    'firstname.lastname', 'flastname', 'f.lastname', 'firstname_lastname',
+                    'firstnamelastname', 'firstname', 'lastname.firstname', 'firstname-lastname',
+                    'f_lastname', 'firstnamel', 'firstname.l', 'fl',
+                ]
+                tried = {email}
+                found_email = None
+                for fmt in all_formats:
+                    candidate = construct_email(first, last, fmt, domain_part)
+                    if candidate in tried or candidate in assigned_emails:
+                        continue
+                    tried.add(candidate)
+                    c_ok, c_stat = _try_zb(candidate)
+                    logger.info(f"   [ZeroBounce] ~ {candidate} ({fmt}) → {c_stat}")
+                    if c_ok:
+                        found_email = candidate
+                        email_status = "valid"
+                        logger.info(f"   [ZeroBounce] ✓ Found valid email via permutation: {found_email}")
+                        break
+
+                if found_email:
+                    # Update the contact email to the working one
+                    assigned_emails.add(found_email)
+                    contact["email"] = found_email
+                    result["email"] = found_email
+                elif is_c_suite:
+                    # C-suite: keep valid, just note the email issue
+                    email_status = zb_stat
+                    logger.warning(
+                        f"   [ZeroBounce] All permutations failed for {name} "
+                        f"— C-suite tier, keeping status={status} with email_note"
+                    )
+                    issues = gpt_result.get("issues", []) + ["email_unverified"]
+                    gpt_result["issues"] = issues
+                else:
+                    # Non-c-suite: downgrade if email is definitively bad
+                    email_status = zb_stat
                     if status == "valid" and zb_stat in ("invalid", "spamtrap", "abuse"):
                         status = "needs_review"
                         issues = gpt_result.get("issues", []) + ["email_invalid"]
                         gpt_result["issues"] = issues
-                        logger.info(
-                            f"  Email invalid ({zb_stat}): {email} — downgraded to needs_review"
-                        )
-                logger.info(f"  ZeroBounce {email}: {email_status}")
-            except Exception as e:
-                logger.warning(f"ZeroBounce failed for {email}: {e}")
-                email_status = "unverified"
+                        logger.warning(f"   [ZeroBounce] ✗ All permutations failed → downgraded to needs_review")
 
         # Step 5: Compile
         result.update({
@@ -324,6 +508,13 @@ def verify_contacts(
             "source": contact.get("source", "n8n"),
         })
 
+        STATUS_ICON = {"valid": "✅", "invalid": "❌", "needs_review": "🔶"}
+        logger.info(
+            f"   {STATUS_ICON.get(status,'?')} FINAL: {name} → {status.upper()} "
+            f"| role='{gpt_result.get('matched_role') or 'none'}' tier={role_tier} "
+            f"| email={email_status} confidence={confidence:.2f}"
+        )
+
         if status == "valid":
             valid_count += 1
         elif status == "invalid":
@@ -332,6 +523,11 @@ def verify_contacts(
             needs_review_count += 1
 
         verified_contacts.append(result)
+
+    logger.info(
+        f"━━━ VERIFIER DONE: {company_name} | "
+        f"✅ valid={valid_count} ❌ invalid={invalid_count} 🔶 review={needs_review_count} ━━━"
+    )
 
     # Step 6: Gap report
     gap_report = _generate_gap_report(
