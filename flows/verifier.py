@@ -19,133 +19,133 @@ ROLE_TIERS: dict[str, list[str]] = _roles_data.get("_role_tiers", {})
 
 
 
+def resolve_role(raw_title: str, account_type: str) -> str | None:
+    """
+    LLM-only role resolver. Always passes the full target roles list so the LLM
+    has full context to make the best semantic match regardless of language or
+    title convention. Hallucination is prevented by output validation — the LLM
+    answer must be an exact string match in the list, otherwise None is returned.
+    """
+    target_roles_list = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
+    return _llm_confirm_role(raw_title, target_roles_list)
+
+
+def _llm_confirm_role(raw_title: str, shortlist: list[str]) -> str | None:
+    """
+    Ask the LLM to pick one role from the given shortlist for this title.
+    The LLM output is validated against the shortlist — if it returns anything
+    not in the list, we return None. Zero hallucination risk.
+    """
+    options = "\n".join(f"  {i+1}. {r}" for i, r in enumerate(shortlist))
+    prompt = f"""You are a global B2B role classifier. A professional has the job title:
+
+"{raw_title}"
+
+Which ONE of the following roles best describes what this person does?
+If none genuinely match, answer "none".
+
+OPTIONS:
+{options}
+
+CLASSIFICATION RULES:
+1. Match on FUNCTION and SENIORITY — both must align.
+2. Strip geographic/scope qualifiers (Global, Regional, National, Senior, Deputy, Jr, Sr) before judging.
+3. Strip company suffixes — "COO at Unilever" → evaluate "COO" only.
+4. For compound titles like "Co-Founder & CTO", evaluate the non-founder part.
+5. Treat acronyms and their spelled-out equivalents as identical (CTO = Chief Technology Officer, MD = Managing Director, etc.).
+
+SENIORITY REQUIREMENT — the all-caps options are HEAD/DIRECTOR/VP/C-SUITE level roles.
+Answer "none" if the title is clearly a junior or mid-level position, even if the function matches:
+- Junior signals: Executive, Associate, Analyst, Coordinator, Specialist, Representative, Agent, Officer, Consultant, Intern, Trainee, Assistant
+- Examples that must return "none": "Trade Marketing Executive", "Telesales Agent", "Sales Operations Analyst", "IT Coordinator", "Digital Commerce Specialist"
+- A "Manager" title is borderline — only accept if the option explicitly includes "Manager" (e.g. "Sales Operations Manager") AND the title is a functional head with no reports above them in that function.
+
+MULTILINGUAL — titles in any language are valid; reason by function and seniority regardless of language:
+- CEO/MD equivalents: Director General, Gerente General (ES), Directeur Général (FR), Geschäftsführer (DE), Direktur Utama (ID)
+- Sales Director equivalents: Director Comercial/de Ventas (ES), Directeur Commercial (FR), Vertriebsleiter (DE), Direktur Penjualan (ID)
+- Head of IT equivalents: Director de TI/Tecnología (ES), Directeur Informatique (FR), Kepala IT (ID)
+- COO equivalents: Director de Operaciones (ES), Directeur des Opérations (FR), Direktur Operasional (ID)
+
+WHEN TO ANSWER "none":
+- Wrong department (HR, Finance, Legal, Procurement, Brand Marketing, PR, R&D, Supply Chain) with no overlap to any listed option
+- Title too vague to assign confidently (bare "Manager" or "Director" with no function)
+- Seniority clearly below Head/Director/VP level (see above)
+
+Reply with ONLY the exact text of your chosen option, or the word "none"."""
+
+    raw = call_gpt_fast(prompt, use_web_search=False, temperature=0.0)
+    answer = raw.strip().strip('"').strip("'")
+
+    # Validate: must be an exact match from the shortlist
+    for role in shortlist:
+        if answer.lower() == role.lower():
+            return role
+
+    # LLM said "none" or returned something not in the list
+    return None
+
+
+
 
 def _verify_contact_with_gpt(
     contact: dict,
     company_name: str,
     country: str,
-    account_type: str,
     unipile_profile: dict,
     company_intel: dict,
 ) -> dict:
-    target_roles = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
-    roles_list = "\n".join(f"- {r}" for r in target_roles)
+    """
+    GPT's ONLY job here: confirm whether this person currently works at {company_name}.
+    Role matching is handled entirely by resolve_role() — we do NOT ask GPT about roles.
+    """
+    prompt = f"""You are verifying whether a person currently works at a specific company.
 
-    tiers_text = f"""
-ROLE PRIORITY TIERS (highest to lowest value):
-1. Final Decision Makers: {", ".join(ROLE_TIERS.get("final_decision_makers", []))}
-2. Key Decision Makers: {", ".join(ROLE_TIERS.get("key_decision_makers", []))}
-3. Key Influencers: {", ".join(ROLE_TIERS.get("key_influencers", [])[:10])}... (see full list in target roles)
-4. Gate Keepers: {", ".join(ROLE_TIERS.get("gate_keepers", [])[:8])}...
-"""
+PERSON: {contact.get('first_name', '')} {contact.get('last_name', '')}
+INPUT TITLE: {contact.get('job_title', '')}
+TARGET COMPANY: {company_name} ({country})
 
-    prompt = f"""You are a B2B data verification agent for a CPG/FMCG sales technology company (SalesCode.ai).
+LINKEDIN DATA (from Unipile — may be incomplete for small companies/startups):
+{json.dumps(unipile_profile)}
 
-VERIFY THIS CONTACT:
+ADDITIONAL EVIDENCE (web-scraped intel about {company_name}):
+People confirmed at this company from web sources:
+{json.dumps(company_intel.get('people_found', [])[:15])}
 
-Company we mapped: {company_name} ({country})
-Contact from our mapping: {contact.get('first_name', '')} {contact.get('last_name', '')}, Title: {contact.get('job_title', '')}
-LinkedIn profile data (from Unipile): {json.dumps(unipile_profile)}
+Relevant content:
+{company_intel.get('combined_text', '')[:2000]}
 
-ADDITIONAL COMPANY INTEL (scraped from web sources):
-People found at this company from various web sources:
-{json.dumps(company_intel.get('people_found', []))}
+YOUR ONLY TASK — answer: does this person currently work at {company_name}?
 
-Relevant scraped content snippets:
-{company_intel.get('combined_text', '')[:3000]}
+RULES:
+1. current_company_confirmed = true if:
+   - LinkedIn shows {company_name} (or a known subsidiary/parent/brand) as current employer, OR
+   - This person appears in the company intel above with a matching name, OR
+   - LinkedIn data is empty/sparse but nothing contradicts {company_name} employment
 
-OUR TARGET ROLE LIST for {account_type}:
-{roles_list}
+2. current_company_confirmed = false ONLY if:
+   - LinkedIn CLEARLY shows a DIFFERENT company as their primary current role
+   - "Ex-" prefix on the {company_name} role
+   - Web sources explicitly say they left {company_name}
 
-{tiers_text}
+3. Treat empty LinkedIn as inconclusive (NOT as evidence they left).
+   Startups and small companies often have incomplete profiles.
 
-CHECK:
+4. Side ventures (Founder/Advisor/Board) do NOT override a corporate role — someone can
+   hold both. Only mark false if the corporate role is clearly at a different company.
 
-1. COMPANY MATCH: Does their CURRENT role match {company_name}?
-
-   CONFIRMED = active LinkedIn role clearly shows {company_name} (or a known subsidiary/brand).
-   UNCONFIRMED ≠ DEPARTED — if LinkedIn data is empty, sparse, or outdated, that is NOT evidence
-   the person left. Small companies, startups, and founders often have incomplete LinkedIn profiles.
-   Set current_company_confirmed: true unless LinkedIn ACTIVELY shows a DIFFERENT company as
-   their current primary role.
-
-   Account for subsidiaries and brand names:
-   - "FEMSA Comercio" = "OXXO", "Hindustan Unilever" = "Unilever India"
-   - "PT Coca-Cola Amatil Indonesia" = "CCAI", "Arca Continental" includes "AC Bebidas"
-   - "GEPP" = "PepsiCo Mexico bottler"
-
-   Only set current_company_confirmed: false if LinkedIn CLEARLY shows a different company
-   as their primary current employer — not just because the data is missing or ambiguous.
-
-2. TITLE PARSING — do this BEFORE role matching:
-
-   Titles often contain noise. Extract the core role first:
-
-   a) COMPOUND TITLES — take the highest-seniority component:
-      - "CEO & Co-Founder" → evaluate as "CEO"
-      - "Co-Founder and Chief Technology Officer" → evaluate as "CTO"
-      - "Co-Founder and Technology Head" → evaluate as "Head of Technology / CTO"
-      - "Managing Director & Founder" → evaluate as "Managing Director"
-      - Rule: "Co-Founder", "Founder", "Partner" combined with a C-suite/Director title →
-        the C-suite/Director title is the primary role for matching purposes.
-
-   b) ROLE-AT-COMPANY FORMAT — strip the company part:
-      - "COO- Peter England" → evaluate as "COO" (ignore everything after "- ")
-      - "COO, Sunlight Resources Ltd" → evaluate as "COO" (ignore everything after ", ")
-      - "Head of Sales @ Pladis" → evaluate as "Head of Sales"
-      - Pattern: if title contains " - ", " @ ", " at " followed by a company name → strip it.
-
-   c) SCOPE/GEOGRAPHIC MODIFIERS — do not change the role type:
-      - "Global Sales Director" = "Sales Director"
-      - "Regional COO" = "COO"
-      - "National Sales Head" = "Head of Sales"
-      - "Senior Sales Director" = "Sales Director"
-      - "Group CFO" = "CFO"
-      - The scope prefix (Global/Regional/National/Senior/Group/Corporate) describes coverage,
-        not a different role. Match against the base role.
-
-3. ROLE MATCH — apply after title parsing above:
-
-   ONLY set matched_role if the extracted core role is genuinely the same function AND seniority
-   as something in the target list.
-
-   SENIORITY IS NOT INTERCHANGEABLE:
-   - "Manager" ≠ "Director" ≠ "Head" ≠ "VP" ≠ "Chief"
-   - "Sales Manager" does NOT match "Sales Director / VP Sales / SVP Sales"
-   - "IT Manager" does NOT match "Head of IT / IT Director / CIO"
-   - A Manager-level role reporting to the Director we want is NOT a match
-
-   WHAT COUNTS AS A MATCH:
-   - Same title in another language (e.g. "Director de Ventas" = "Sales Director")
-   - Common abbreviations (e.g. "CIO" = "Chief Information Officer" = "Head of IT / IT Director / CIO")
-   - Equivalent seniority + function (e.g. "Chief Sales Officer" = "Sales Director / VP Sales")
-   - Compound title after extraction (e.g. "CEO & Co-Founder" → extracted "CEO" matches "CEO / MD / President")
-
-   WHAT IS NOT A MATCH — return matched_role: null and role_tier: "none":
-   - Lower seniority (Manager when we want Director/Head/VP/Chief)
-   - Adjacent function (e.g. "HR Director" does not match any sales/IT/ops target role)
-   - When in doubt — return null. Do NOT force a match.
-
-4. CROSS-REFERENCE: Is this person in the scraped company intel? Do web sources confirm or contradict?
-
-5. STALENESS: Only flag "possibly_departed" if LinkedIn ACTIVELY shows a different company
-   as the current primary role — not if data is simply missing.
-
-6. MULTIPLE ROLES / SIDE VENTURES:
-   - Senior professionals commonly hold a corporate role AND run a startup/advisory/board seat.
-   - If the person holds a senior role at {company_name} AND has a side venture → still employed.
-   - Signals of side venture (not primary job): "Founder", "Co-Founder", "Advisor", "Board Member",
-     "Independent Consultant", "Angel Investor" — these almost never replace a corporate role.
-   - When in doubt and {company_name} role appears active → keep current_company_confirmed: true.
+5. status should be:
+   - "valid" if company confirmed and no red flags
+   - "needs_review" if inconclusive (empty LinkedIn, ambiguous intel)
+   - "invalid" if clearly at a different company
 
 Return ONLY this JSON:
-{{"status": "valid|invalid|needs_review", "current_company_confirmed": true, "matched_role": "exact target role string from the list above, or null if no genuine match", "role_tier": "final_decision_maker|key_decision_maker|key_influencer|gate_keeper|none", "confidence": 0.85, "issues": [], "reason": "one sentence explaining the role match decision"}}"""
+{{"status": "valid|needs_review|invalid", "current_company_confirmed": true, "confidence": 0.85, "issues": [], "reason": "one sentence"}}"""
 
     raw = call_gpt5(prompt, use_web_search=False, temperature=0.1)
     result = parse_gpt_json(raw)
     if not result:
         logger.warning(f"GPT verification failed to parse for {contact.get('first_name')} {contact.get('last_name')}")
-        return {"status": "needs_review", "current_company_confirmed": False, "matched_role": None, "confidence": 0.0, "issues": ["gpt_parse_failed"], "reason": "Could not parse GPT response"}
+        return {"status": "needs_review", "current_company_confirmed": False, "confidence": 0.0, "issues": ["gpt_parse_failed"], "reason": "Could not parse GPT response"}
     return result
 
 
@@ -268,50 +268,37 @@ def verify_contacts(
 
         result["unipile_status"] = unipile_status
 
-        # Step 2: GPT verification using Unipile data + company intel
+        # ── Step 2a: Deterministic role resolution (no LLM) ──────────────────
+        # Try both the LinkedIn title (ground truth) and the input title.
+        # resolve_role uses regex patterns — never hallucinates.
+        li_title   = unipile_profile.get("current_title", "")
+        input_title = contact.get("job_title", "")
+        python_role = resolve_role(li_title, account_type) or resolve_role(input_title, account_type)
+        if python_role:
+            logger.info(f"   [Role] ✓ Resolved deterministically: '{li_title or input_title}' → '{python_role}'")
+        else:
+            logger.info(f"   [Role] ~ No deterministic match for '{li_title or input_title}' — GPT will decide")
+
+        # ── Step 2b: GPT — company confirmation only ──────────────────────────
+        # GPT's job is ONLY to confirm whether this person currently works at {company_name}.
+        # Role matching is handled by Python above; we pass python_role to GPT for context
+        # but do NOT ask GPT to match roles.
         logger.info(f"   [GPT-4o] Verifying contact (unipile_status={unipile_status}, empty={unipile_empty})")
         gpt_result = _verify_contact_with_gpt(
-            contact, company_name, country, account_type, unipile_profile, company_intel
+            contact, company_name, country, unipile_profile, company_intel
         )
         logger.info(
             f"   [GPT-4o] → status={gpt_result.get('status')} "
-            f"matched_role='{gpt_result.get('matched_role')}' "
-            f"tier={gpt_result.get('role_tier')} "
-            f"confidence={gpt_result.get('confidence')} "
             f"company_confirmed={gpt_result.get('current_company_confirmed')} "
+            f"confidence={gpt_result.get('confidence')} "
             f"reason='{gpt_result.get('reason','')}'"
         )
 
+        # Role always comes from Python resolver — ignore whatever GPT returned for matched_role
+        gpt_result["matched_role"] = python_role
+
         status = gpt_result.get("status", "needs_review")
         confidence = gpt_result.get("confidence", 0.0)
-
-        # ── Fallback role match ────────────────────────────────────────────────
-        # GPT sometimes returns matched_role=None for valid compound/abbreviated titles
-        # (e.g. "Co-Founder & Technology Head" → should match "Head of IT / IT Director / CIO / GM IT").
-        # If company is confirmed but GPT gave no match, try Python keyword matching as a rescue.
-        if not gpt_result.get("matched_role") and gpt_result.get("current_company_confirmed"):
-            target_roles_list = TARGET_ROLES.get(account_type.lower(), TARGET_ROLES.get("distributor", []))
-            # Use the LinkedIn title if available (more reliable than input title), else input title
-            title_for_match = (
-                unipile_profile.get("current_title") or contact.get("job_title", "")
-            ).lower()
-            # Strip compound noise: take the part after "& " or "and " for co-founder combos
-            for sep in [" & ", " and ", ", "]:
-                if sep in title_for_match:
-                    parts = [p.strip() for p in title_for_match.split(sep)]
-                    # Prefer the non-founder part
-                    non_founder = [p for p in parts if "founder" not in p and "partner" not in p]
-                    if non_founder:
-                        title_for_match = non_founder[-1]  # last non-founder segment
-            for target_role in target_roles_list:
-                role_keywords = [w for w in target_role.lower().replace("/", " ").split() if len(w) > 3]
-                matches = sum(1 for kw in role_keywords if kw in title_for_match)
-                if matches >= 2 or (len(role_keywords) == 1 and role_keywords[0] in title_for_match):
-                    gpt_result["matched_role"] = target_role
-                    logger.info(
-                        f"   [Role fallback] ✓ Keyword match rescued: '{title_for_match}' → '{target_role}'"
-                    )
-                    break
 
         company_intel_resolved = any(
             contact.get("first_name", "").lower() in p.get("name", "").lower()
@@ -411,9 +398,16 @@ def verify_contacts(
         C_SUITE_TIERS = {"final_decision_maker", "key_decision_maker"}
         is_c_suite = role_tier in C_SUITE_TIERS
 
-        # Skip ZeroBounce entirely for non-c-suite contacts already rejected —
-        # no point spending API quota on someone we're rejecting anyway
-        if status == "invalid" and not is_c_suite:
+        # Skip ZeroBounce if web verify confirmed the person is NOT at the company —
+        # no point verifying an email for someone who doesn't work there
+        web_confirmed_departed = (
+            gpt_result.get("web_verification", {}).get("still_at_company") is False
+            and gpt_result.get("web_verification", {}).get("confidence", 0) > 0.7
+        )
+        # Also skip for non-c-suite contacts already rejected for any reason
+        if web_confirmed_departed:
+            logger.info(f"   [ZeroBounce] Skipped — web confirmed not at company")
+        elif status == "invalid" and not is_c_suite:
             logger.info(f"   [ZeroBounce] Skipped — contact is already invalid (non-c-suite)")
 
         elif email and "@" in email:

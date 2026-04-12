@@ -47,10 +47,11 @@ def extract_username(url: str) -> str | None:
 
 def _do_fetch_profile(username: str) -> dict:
     rate_limit("unipile")
+    account_id = _next_search_account()  # rotate across all accounts
     response = requests.get(
         f"{UNIPILE_BASE_URL}/api/v1/users/{username}",
         headers=_headers(),
-        params={"account_id": UNIPILE_ACCOUNT_ID},
+        params={"account_id": account_id},
         timeout=REQUEST_TIMEOUT,
     )
     if response.status_code in (404, 403, 401):
@@ -181,7 +182,12 @@ def extract_profile_fields(profile: dict) -> dict:
     if not profile or profile.get("_not_found"):
         return {}
 
-    positions = profile.get("positions", profile.get("experience", []))
+    positions = (
+        profile.get("positions")
+        or profile.get("current_positions")
+        or profile.get("experience")
+        or []
+    )
     current = next(
         (p for p in positions if not p.get("end_date") and not p.get("endDate")),
         positions[0] if positions else {},
@@ -189,18 +195,21 @@ def extract_profile_fields(profile: dict) -> dict:
 
     # Fall back to parsing headline when positions are empty
     # e.g. "Chief Commercial Officer at Britannia Industries Limited"
+    # Handles multilingual separators: "at" (EN), "en" (ES), "à" (FR), "bei" (DE), "di" (IT)
     headline = profile.get("headline", "")
     headline_title = ""
     headline_company = ""
     if headline and not current:
-        parts = headline.split(" at ", 1)
-        if len(parts) == 2:
-            headline_title = parts[0].strip()
-            headline_company = parts[1].strip()
+        for sep in (" at ", " en ", " à ", " bei ", " di ", " @ "):
+            if sep in headline:
+                parts = headline.split(sep, 1)
+                headline_title = parts[0].strip()
+                headline_company = parts[1].strip()
+                break
 
     return {
         "current_company": current.get("company", current.get("companyName", "")) or headline_company,
-        "current_title": current.get("title", current.get("jobTitle", "")) or headline_title,
+        "current_title": current.get("title", current.get("jobTitle", current.get("role", ""))) or headline_title,
         "headline": headline,
         "location": profile.get("location", profile.get("geoLocation", "")),
         "first_name": profile.get("first_name", ""),

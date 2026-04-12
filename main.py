@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Body, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -493,7 +493,10 @@ async def _fire_pipeline_for_company(company_name: str, reason: str) -> None:
     """Add company to the buffer (empty — pipeline reads from sheet) and flush."""
     _n8n_pending_companies.pop(company_name, None)
     task = _n8n_auto_trigger_tasks.pop(company_name, None)
-    if task and not task.done():
+    # Only cancel the poller task if it is NOT the task calling us right now.
+    # When _poll_sheet_until_ready fires us, cancelling it would inject a
+    # CancelledError at the next `await` (run_in_executor), killing the pipeline.
+    if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
     logger.info(f"Firing pipeline for '{company_name}' — reason: {reason}")
     # Only hold the lock briefly to register the company — never hold it during flush
@@ -737,6 +740,9 @@ input:focus,select:focus{outline:none;border-color:#6366f1}
 .btn-run{width:100%;margin-top:10px;padding:11px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer}
 .btn-run:hover{background:#4f46e5}
 .btn-run:disabled{background:#a5b4fc;cursor:not-allowed}
+.btn-amber{background:#f59e0b;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;padding:9px 20px;white-space:nowrap}
+.btn-amber:hover{background:#d97706}
+.btn-amber:disabled{background:#fcd34d;cursor:not-allowed}
 .btn-sm{padding:6px 14px;font-size:12px;font-weight:500;border:1.5px solid #e5e7eb;border-radius:6px;background:#f9fafb;cursor:pointer;margin-right:8px}
 .btn-sm:hover{background:#f3f4f6}
 .alert{padding:10px 14px;border-radius:7px;font-size:13px;margin-bottom:14px}
@@ -796,6 +802,21 @@ input:focus,select:focus{outline:none;border-color:#6366f1}
       </div>
       <button class="btn-run" type="submit" id="runBtn">▶ Run Pipeline</button>
     </form>
+  </div>
+
+  <!-- ── Re-run card ─────────────────────────────────────────────────────── -->
+  <div class="card">
+    <h2>↩ Re-run Pipeline (n8n already wrote to sheet)</h2>
+    <p style="font-size:12px;color:#6b7280;margin-bottom:14px">Use when n8n has already written contacts to the sheet but the pipeline didn't fire. Picks up whatever is in the First Clean List sheet for that company.</p>
+    <div style="display:flex;gap:10px;align-items:flex-end">
+      <div style="flex:1">
+        <label>Company Name</label>
+        <input id="rerunCompany" placeholder="e.g. Heineken España" list="companySuggestions" autocomplete="off">
+        <datalist id="companySuggestions"></datalist>
+      </div>
+      <button class="btn-amber" id="rerunBtn" onclick="rerunPipeline()">▶ Run Now</button>
+    </div>
+    <div id="rerunAlert" style="margin-top:10px;display:none"></div>
   </div>
 
   <div id="panel">
@@ -979,6 +1000,62 @@ async function flushNow(){
   document.getElementById('helpers').style.display='none';
   setAlert('<span class="spin"></span>Flushing pipeline…');
 }
+
+async function loadCompanySuggestions(){
+  try{
+    const d = await fetch('/api/n8n/companies').then(r=>r.json());
+    const list = document.getElementById('companySuggestions');
+    list.innerHTML = Object.keys(d.companies||{})
+      .map(n=>`<option value="${n}">`)
+      .join('');
+  }catch(e){}
+}
+
+function setRerunAlert(msg,type='blue'){
+  const el=document.getElementById('rerunAlert');
+  el.style.display='block';
+  el.innerHTML=`<div class="alert ${type}">${msg}</div>`;
+}
+
+async function rerunPipeline(){
+  const name=(document.getElementById('rerunCompany').value||'').trim();
+  if(!name){alert('Enter a company name first.');return;}
+  const btn=document.getElementById('rerunBtn');
+  btn.disabled=true;
+  btn.textContent='Firing…';
+  try{
+    const resp=await fetch('/api/pipeline/run',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({company_name:name})
+    });
+    const result=await resp.json();
+    if(!resp.ok){
+      setRerunAlert('Error: '+(result.detail||'Unknown error'),'red');
+      return;
+    }
+    // Show the progress panel for this company
+    company=name;
+    document.getElementById('panel').style.display='block';
+    document.getElementById('summCard').style.display='none';
+    document.getElementById('compName').textContent=name;
+    document.getElementById('compStep').textContent='Pipeline starting…';
+    document.getElementById('steps').innerHTML=renderSteps({});
+    document.getElementById('helpers').style.display='none';
+    setAlert('<span class="spin"></span>Pipeline firing for <b>'+name+'</b>…');
+    setRerunAlert('&#10003; Pipeline queued for <b>'+name+'</b> — progress shown below.','green');
+    if(pollId) clearInterval(pollId);
+    pollId=setInterval(poll,3000);
+  }catch(e){
+    setRerunAlert('Error: '+e.message,'red');
+  }finally{
+    btn.disabled=false;
+    btn.textContent='▶ Run Now';
+  }
+}
+
+// Pre-fill company suggestions from known metadata
+loadCompanySuggestions();
 
 document.getElementById('frm').addEventListener('submit',async e=>{
   e.preventDefault();
@@ -1545,6 +1622,62 @@ async def n8n_done(request: Request):
         "status": "ok",
         "company": company_name,
         "message": f"Pipeline started for '{company_name}'",
+    }
+
+
+@app.post("/api/pipeline/run")
+async def pipeline_run_direct(body: dict = Body(...)):
+    """
+    Fire the full pipeline for a specific company immediately.
+    Does NOT require contacts to be in the buffer — reads them from the
+    First Clean List sheet (which n8n already wrote to).
+
+    Optionally accepts metadata fields (country, domain, account_type,
+    email_format, sales_nav_url) to set or override _company_metadata.
+    """
+    company_name = (body.get("company_name") or "").strip()
+    if not company_name:
+        raise HTTPException(status_code=400, detail="company_name is required")
+
+    if _n8n_chain_running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Pipeline already running for '{_n8n_chain_current_company}' — wait for it to finish"
+        )
+
+    # Merge any supplied metadata — fills in country/domain/account_type if not already known
+    meta_fields = ["country", "domain", "account_type", "email_format", "sales_nav_url", "linkedin_numeric_id"]
+    supplied = {k: body[k] for k in meta_fields if body.get(k)}
+    if supplied:
+        existing = _company_metadata.get(company_name, {})
+        _company_metadata[company_name] = {**existing, **supplied}
+
+    # Cancel any running sheet poller for this company (clean slate)
+    task = _n8n_auto_trigger_tasks.pop(company_name, None)
+    if task and not task.done():
+        task.cancel()
+    _n8n_pending_companies.pop(company_name, None)
+
+    # Put company in buffer (empty — pipeline reads contacts from sheet)
+    async with _n8n_buffer_lock:
+        _n8n_buffer_contacts[company_name] = []
+        if _n8n_buffer_timer and not _n8n_buffer_timer.done():
+            _n8n_buffer_timer.cancel()
+
+    # Fire pipeline in its own task so the HTTP response returns immediately
+    asyncio.create_task(_n8n_buffer_flush())
+
+    meta = _company_metadata.get(company_name, {})
+    logger.info(
+        f"Manual pipeline run triggered for '{company_name}' "
+        f"(country={meta.get('country','')} domain={meta.get('domain','')} "
+        f"account_type={meta.get('account_type','')})"
+    )
+    return {
+        "status": "firing",
+        "company": company_name,
+        "meta_known": bool(meta),
+        "meta": {k: meta.get(k, "") for k in ["country", "domain", "account_type"]},
     }
 
 

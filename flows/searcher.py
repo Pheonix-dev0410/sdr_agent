@@ -248,10 +248,16 @@ Return ONLY this JSON:
 
 
 def _layer5_deep_search(
-    current_role: str, company_name: str, country: str, account_type: str, search_terms: list[str]
+    current_role: str, company_name: str, country: str, account_type: str,
+    search_terms: list[str], already_found_names: list[str] | None = None,
 ) -> dict | None:
-    prompt = f"""I MUST find someone at "{company_name}" in {country} who handles "{current_role}" or anything related.
+    exclude_note = ""
+    if already_found_names:
+        names_str = ", ".join(already_found_names)
+        exclude_note = f"\nDo NOT suggest any of these people — they are already assigned to other roles: {names_str}\n"
 
+    prompt = f"""I MUST find someone at "{company_name}" in {country} who handles "{current_role}" or anything related.
+{exclude_note}
 Previous searches found nothing. Try unconventional sources:
 1. Search for the company owner/founder - in small companies they often handle multiple roles
 2. Search for ANY employee and look for org chart clues
@@ -519,7 +525,12 @@ def search_gaps(
         # Layer 5: Deep GPT web search
         if not match:
             logger.info(f"   [L5 GPT-4o+web] Deep search")
-            match = _layer5_deep_search(role, company_name, country, account_type, search_terms)
+            already_found = [
+                f"{c.get('first_name','')} {c.get('last_name','')}".strip()
+                for c in new_contacts + existing_contacts
+                if c.get("first_name") or c.get("last_name")
+            ]
+            match = _layer5_deep_search(role, company_name, country, account_type, search_terms, already_found)
             if match:
                 logger.info(f"   [L5 GPT-4o+web] ✓ Found: {match.get('first_name')} {match.get('last_name')} source='{match.get('source')}' adjacent={match.get('is_adjacent_role')}")
             else:

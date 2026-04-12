@@ -27,7 +27,8 @@
       "Bash(python -c \"from clients.openai_client import call_gpt5; print\\(call_gpt5\\('hi :\\)'\\)\\)\")",
       "Bash(python -c \"import flows.verifier; print\\('OK'\\)\")",
       "Bash(python -c \"import flows.verifier; import flows.searcher; print\\('imports OK'\\)\")",
-      "Bash(python -c \"import flows.verifier; import main; print\\('imports OK'\\)\")"
+      "Bash(python -c \"import flows.verifier; import main; print\\('imports OK'\\)\")",
+      "Bash(python -c \"import flows.verifier; import flows.searcher; print\\('OK'\\)\")"
     ]
   }
 }
